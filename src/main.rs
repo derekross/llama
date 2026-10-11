@@ -166,6 +166,7 @@ fn player(args: &[String]) -> Result<()> {
             }
             let mut w = &stream;
             let _ = writeln!(w, "ok");
+            log::debug!("control: {:?}", line.trim());
             match line.trim() {
                 "quit" => ping.ping(),
                 "show" => show.ping(),

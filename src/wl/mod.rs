@@ -380,6 +380,7 @@ impl App {
         if self.hidden {
             return;
         }
+        log::debug!("minimizing");
         self.close_menu();
         self.save_state(true);
         let (window, viewport, fractional) = new_window(
