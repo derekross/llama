@@ -160,6 +160,7 @@ pub fn run(opts: Opts) -> Result<()> {
         scale: 1.0,
         configured: false,
         hidden: false,
+        place_pending: true,
         frame_pending: false,
         dirty: true,
         exit: false,
@@ -262,6 +263,8 @@ struct App {
     configured: bool,
     /// Minimized: unmapped, while the music plays on.
     hidden: bool,
+    /// Put the window back at the saved position once it maps.
+    place_pending: bool,
     frame_pending: bool,
     dirty: bool,
     exit: bool,
@@ -308,6 +311,7 @@ impl App {
         if self.hidden {
             return;
         }
+        self.save_state();
         let (window, viewport, fractional) = new_window(
             &self.compositor,
             &self.xdg,
@@ -335,6 +339,7 @@ impl App {
             return;
         }
         self.hidden = false;
+        self.place_pending = true;
         self.dirty = true;
         self.window.commit();
     }
@@ -415,6 +420,12 @@ impl App {
         self.window.commit();
         self.frame_pending = true;
         self.dirty = false;
+        if self.place_pending {
+            self.place_pending = false;
+            if let Some((x, y)) = self.state.pos {
+                crate::hypr::restore(x, y);
+            }
+        }
         if !self.shown {
             self.shown = true;
             log::info!(
@@ -489,6 +500,11 @@ impl App {
         self.state.pl_h = v.pl_h;
         self.state.time_remaining = v.time_remaining;
         self.state.vis_on = v.vis_on;
+        if !self.hidden
+            && let Some(pos) = crate::hypr::position()
+        {
+            self.state.pos = Some(pos);
+        }
         // Merge with the file so a skin picked meanwhile is not lost.
         let disk = State::load();
         self.state.skin = disk.skin.or(self.state.skin.take());

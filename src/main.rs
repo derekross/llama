@@ -68,14 +68,7 @@ fn send_control(cmd: &str) -> Option<String> {
 }
 
 fn focus_existing() {
-    let _ = Command::new("hyprctl")
-        .args([
-            "dispatch",
-            "focuswindow",
-            &format!("class:^({})$", llama::wl::APP_ID),
-        ])
-        .stdout(Stdio::null())
-        .status();
+    llama::hypr::focus(llama::wl::APP_ID);
 }
 
 static QUIT: OnceLock<Ping> = OnceLock::new();

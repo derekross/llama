@@ -72,6 +72,9 @@ pub struct State {
     pub pl_h: i32,
     pub time_remaining: bool,
     pub vis_on: bool,
+    /// Where the window last sat (Hyprland layout pixels), restored when it
+    /// opens or comes back from being minimized.
+    pub pos: Option<(i32, i32)>,
 }
 
 impl Default for State {
@@ -87,6 +90,7 @@ impl Default for State {
             pl_h: 116 + 29 * 2,
             time_remaining: false,
             vis_on: true,
+            pos: None,
         }
     }
 }
