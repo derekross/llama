@@ -1,0 +1,37 @@
+[package]
+name = "llama"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Winamp 2.x for Omarchy: classic skins, cliamp underneath."
+repository = "https://github.com/derekross/llama"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
+
+# Skins: a .wsz is a zip of BMP sprite sheets.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "png"] }
+
+# Playlist text, drawn without smoothing in the skin's font.
+ab_glyph = "0.2"
+
+# Skin Museum (api.webamp.org) and skin downloads.
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+
+# The window: plain Wayland, CPU-drawn into shared memory.
+smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop", "xkbcommon"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

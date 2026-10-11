@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "id": "derekross.llama",
+  "name": "Llama",
+  "version": "0.1.0",
+  "author": "Derek Ross",
+  "license": "MIT",
+  "description": "Winamp 2.x for Omarchy. A mini player in the bar, every cliamp source (Spotify, Tidal, YouTube Music, Plex, Jellyfin, radio...) a search away, and 100,000 classic skins from the Winamp Skin Museum for the Llama player window. Needs the llama binary: run dist/install.sh.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "shell-plugin/BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Llama",
+    "description": "Now playing, transport and volume; search your music sources; dress the Winamp window in any classic skin.",
+    "category": "Media",
+    "aliases": [
+      "winamp",
+      "music",
+      "cliamp",
+      "player",
+      "skins"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showTitle": false
+    },
+    "schema": [
+      {
+        "key": "showTitle",
+        "type": "boolean",
+        "label": "Show the track title on the bar",
+        "defaultValue": false
+      }
+    ]
+  }
+}
