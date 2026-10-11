@@ -2,6 +2,8 @@
 
 **Winamp 2.x for Omarchy.** It really whips the llama's ass.
 
+![Llama in the Winamp5 Classified skin, beside the bar panel's Skin Museum browser](preview.png)
+
 Llama is the classic Winamp window (main, equalizer and playlist) drawn pixel for pixel from real `.wsz` skins. That's any of the ~100,000 in the [Winamp Skin Museum](https://skins.webamp.org/). It plays everything [cliamp](https://github.com/bjarneo/cliamp) can play: local files, Spotify, Tidal, Qobuz, YouTube and YouTube Music, SoundCloud, Mixcloud, Bandcamp, Plex, Jellyfin, Emby, Navidrome, Lyrion, Audiobookshelf, podcasts and ~58,000 radio stations.
 
 It's written in Rust and draws on the CPU into a plain Wayland surface, with no GPU, browser engine, Qt or GTK.
