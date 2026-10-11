@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "omarchy $*" >> "${FAKE_LOG:-/dev/null}"
+exit 0

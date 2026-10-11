@@ -1,7 +1,8 @@
 [package]
 name = "llama"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT"
 description = "Winamp 2.x for Omarchy: classic skins, cliamp underneath."
 repository = "https://github.com/derekross/llama"

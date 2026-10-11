@@ -109,3 +109,37 @@ pub fn focus(app_id: &str) {
         &["focuswindow", &window],
     );
 }
+
+/// Pins this process's window (shown on every workspace) or unpins it,
+/// once Hyprland has it mapped. Pin is a toggle, so it checks first.
+pub fn pin(on: bool) {
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let pid = std::process::id() as u64;
+            let found = json(&["clients", "-j"]).and_then(|c| {
+                c.as_array()?.iter().find_map(|c| {
+                    (c["pid"].as_u64() == Some(pid) && c["mapped"].as_bool() != Some(false)).then(
+                        || {
+                            (
+                                c["address"].as_str().unwrap_or_default().to_string(),
+                                c["pinned"].as_bool().unwrap_or(false),
+                            )
+                        },
+                    )
+                })
+            });
+            if let Some((address, pinned)) = found {
+                if pinned != on && !address.is_empty() {
+                    let window = format!("address:{address}");
+                    dispatch(
+                        &format!("hl.dsp.window.pin({{ window = \"{window}\" }})"),
+                        &["pin", &window],
+                    );
+                }
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    });
+}

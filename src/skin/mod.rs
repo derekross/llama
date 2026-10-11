@@ -14,6 +14,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
+const MAX_SHEET_DIM: u32 = 2048;
+
 /// An image in 0xAARRGGBB pixels.
 #[derive(Clone, Debug, Default)]
 pub struct Image {
@@ -35,8 +37,18 @@ impl Image {
         (x >= 0 && y >= 0 && x < self.w && y < self.h).then(|| self.px[(y * self.w + x) as usize])
     }
 
+    /// Decodes a BMP or PNG, refusing anything far larger than a sprite
+    /// sheet before allocating for it (real sheets are ≤ ~350×300).
     fn decode(bytes: &[u8]) -> Option<Image> {
-        let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(MAX_SHEET_DIM);
+        limits.max_image_height = Some(MAX_SHEET_DIM);
+        limits.max_alloc = Some(64 << 20);
+        let mut reader = image::ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()?;
+        reader.limits(limits);
+        let img = reader.decode().ok()?.to_rgba8();
         let (w, h) = img.dimensions();
         let px = img
             .pixels()
@@ -156,22 +168,16 @@ impl Skin {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let files = if path.is_dir() {
-            read_dir_files(path)?
-        } else {
-            let bytes =
-                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-            read_zip_files(&bytes)?
-        };
-        Ok(Skin::from_files(name, files))
+        Ok(Skin::from_files(name, read_skin_files(path)?))
     }
 
     pub fn from_wsz(name: &str, bytes: &[u8]) -> Result<Skin> {
         Ok(Skin::from_files(name.to_string(), read_zip_files(bytes)?))
     }
 
-    /// Builds a skin from (lower-cased basename → bytes).
-    fn from_files(name: String, files: HashMap<String, Vec<u8>>) -> Skin {
+    /// Builds a skin from (lower-cased basename → bytes), as returned by
+    /// [`read_skin_files`].
+    pub fn from_files(name: String, files: HashMap<String, Vec<u8>>) -> Skin {
         let mut sheets = HashMap::new();
         for sheet in Sheet::ALL {
             if let Some(img) = files.get(sheet.file()).and_then(|b| Image::decode(b)) {
@@ -216,6 +222,11 @@ impl Skin {
         self
     }
 
+    /// Whether this is a skin at all: main.bmp is there and decodes.
+    pub fn has_main(&self) -> bool {
+        self.sheets.contains_key(&Sheet::Main)
+    }
+
     pub fn sheet(&self, sheet: Sheet) -> Option<&Image> {
         self.sheets.get(&sheet)
     }
@@ -245,16 +256,49 @@ fn basename(name: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// The files Llama reads; everything else in an archive or folder is
+/// skipped unread.
 fn wanted(name: &str) -> bool {
-    name.ends_with(".bmp") || name.ends_with(".txt") || name.ends_with(".png")
+    Sheet::ALL.iter().any(|s| s.file() == name)
+        || matches!(name, "viscolor.txt" | "pledit.txt" | "region.txt")
 }
 
+/// Limits for hostile archives and folders. A real skin is well under 1 MB
+/// unpacked; the biggest sheets are a few hundred KB.
 const MAX_ENTRY: u64 = 8 << 20;
+const MAX_TOTAL: u64 = 32 << 20;
+const MAX_ENTRIES: usize = 4096;
+/// The largest `.wsz` read from disk or the Museum.
+pub const MAX_WSZ: u64 = 16 << 20;
+const MAX_DEPTH: usize = 2;
+
+/// Reads a `.wsz`/`.zip` file or a skin folder into (lower-cased basename →
+/// bytes), keeping only the files Llama uses, within the limits above.
+pub fn read_skin_files(path: &Path) -> Result<HashMap<String, Vec<u8>>> {
+    if path.is_dir() {
+        return read_dir_files(path);
+    }
+    read_zip_files(&read_capped(path, MAX_WSZ)?)
+}
+
+/// Reads a file, failing if it is larger than `max` bytes.
+pub fn read_capped(path: &Path, max: u64) -> Result<Vec<u8>> {
+    let f = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut buf = Vec::new();
+    f.take(max + 1)
+        .read_to_end(&mut buf)
+        .with_context(|| format!("reading {}", path.display()))?;
+    if buf.len() as u64 > max {
+        bail!("{} is too large to be a skin", path.display());
+    }
+    Ok(buf)
+}
 
 fn read_zip_files(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>> {
     let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).context("not a zip archive")?;
     let mut files = HashMap::new();
-    for i in 0..zip.len() {
+    let mut budget = MAX_TOTAL;
+    for i in 0..zip.len().min(MAX_ENTRIES) {
         let Ok(mut entry) = zip.by_index(i) else {
             continue;
         };
@@ -267,9 +311,18 @@ fn read_zip_files(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>> {
         if !wanted(&name) || files.contains_key(&name) {
             continue;
         }
-        let mut buf = Vec::with_capacity(entry.size() as usize);
-        if entry.by_ref().take(MAX_ENTRY).read_to_end(&mut buf).is_ok() {
+        // The declared size may lie; `take` bounds what is really inflated,
+        // and everything inflated counts, kept or not, so repeated
+        // oversized entries can't spin either.
+        let cap = MAX_ENTRY.min(budget);
+        let mut buf = Vec::with_capacity(entry.size().min(cap) as usize);
+        let ok = entry.by_ref().take(cap + 1).read_to_end(&mut buf).is_ok();
+        budget = budget.saturating_sub(buf.len() as u64);
+        if ok && buf.len() as u64 <= cap {
             files.insert(name, buf);
+        }
+        if budget == 0 {
+            break;
         }
     }
     if files.is_empty() {
@@ -278,21 +331,38 @@ fn read_zip_files(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>> {
     Ok(files)
 }
 
+/// Walks a skin folder at most `MAX_DEPTH` levels down, never following
+/// symlinks, under the same limits as an archive.
 fn read_dir_files(dir: &Path) -> Result<HashMap<String, Vec<u8>>> {
     let mut files = HashMap::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
+    let mut budget = MAX_TOTAL;
+    let mut seen = 0;
+    let mut stack = vec![(dir.to_path_buf(), 0)];
+    while let Some((d, depth)) = stack.pop() {
         for entry in std::fs::read_dir(&d)?.flatten() {
+            seen += 1;
+            if seen > MAX_ENTRIES {
+                return Ok(files);
+            }
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
             let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
+            if ft.is_dir() {
+                if depth < MAX_DEPTH {
+                    stack.push((path, depth + 1));
+                }
                 continue;
             }
+            if !ft.is_file() {
+                continue; // symlinks, sockets, fifos
+            }
             let name = basename(&path.to_string_lossy());
-            if wanted(&name)
-                && !files.contains_key(&name)
-                && let Ok(b) = std::fs::read(&path)
-            {
+            if !wanted(&name) || files.contains_key(&name) {
+                continue;
+            }
+            if let Ok(b) = read_capped(&path, MAX_ENTRY.min(budget)) {
+                budget -= b.len() as u64;
                 files.insert(name, b);
             }
         }
@@ -358,20 +428,40 @@ fn parse_pledit(text: &str) -> PlColors {
     pl
 }
 
+/// A skin from tests/skins/ (fetched by tests/fetch-skins.sh, not shipped),
+/// or `None` with a hint when it is missing, so tests that need one skip.
+#[cfg(test)]
+pub fn test_skin(name: &str) -> Option<Skin> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/skins")
+        .join(format!("{name}.wsz"));
+    if !path.exists() {
+        eprintln!(
+            "skipping: {} is missing; run tests/fetch-skins.sh",
+            path.display()
+        );
+        return None;
+    }
+    Some(Skin::load(&path).unwrap())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn skin(name: &str) -> Skin {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/skins")
-            .join(format!("{name}.wsz"));
-        Skin::load(&path).unwrap()
+    /// Skips the calling test when the fixture skins are missing.
+    macro_rules! skin {
+        ($name:expr) => {
+            match test_skin($name) {
+                Some(s) => s,
+                None => return,
+            }
+        };
     }
 
     #[test]
     fn base_skin_has_every_sheet() {
-        let s = skin("base-2.91");
+        let s = skin!("base-2.91");
         for sheet in Sheet::ALL {
             if sheet == Sheet::NumsEx {
                 continue;
@@ -387,23 +477,23 @@ mod tests {
     #[test]
     fn nested_folder_and_odd_case() {
         // XMMS-Turquoise keeps everything in a subfolder, "Pledit.bmp" capitalised.
-        let s = skin("XMMS-Turquoise");
+        let s = skin!("XMMS-Turquoise");
         assert!(s.sheet(Sheet::Pledit).is_some());
         assert!(s.sheet(Sheet::Main).is_some());
     }
 
     #[test]
     fn nums_ex_preferred() {
-        let s = skin("Green-Dimension-V2");
+        let s = skin!("Green-Dimension-V2");
         let (_, ex) = s.digits().unwrap();
         assert!(ex);
     }
 
     #[test]
     fn fallback_fills_missing_sheets_but_keeps_digits() {
-        let base = skin("base-2.91");
+        let base = skin!("base-2.91");
         // MacOSXAqua ships nums_ex but no numbers.bmp, and no titlebar cursor files.
-        let s = skin("MacOSXAqua1-5").with_fallback(&base);
+        let s = skin!("MacOSXAqua1-5").with_fallback(&base);
         assert!(s.sheet(Sheet::Numbers).is_none());
         assert!(s.digits().unwrap().1);
         for sheet in Sheet::ALL {
@@ -424,7 +514,7 @@ mod tests {
             "Vizor1-01",
             "XMMS-Turquoise",
         ] {
-            let s = skin(name);
+            let s = skin!(name);
             assert!(s.sheet(Sheet::Main).is_some(), "{name}");
         }
     }
@@ -452,5 +542,97 @@ mod tests {
         files.insert("main.bmp".to_string(), b"BMnot really".to_vec());
         let s = Skin::from_files("x".into(), files);
         assert!(s.sheet(Sheet::Main).is_none());
+    }
+
+    fn bmp(w: u32, h: u32) -> Vec<u8> {
+        let mut out = Cursor::new(Vec::new());
+        image::RgbImage::new(w, h)
+            .write_to(&mut out, image::ImageFormat::Bmp)
+            .unwrap();
+        out.into_inner()
+    }
+
+    fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .large_file(true);
+        for (name, bytes) in entries {
+            w.start_file(*name, opts).unwrap();
+            w.write_all(bytes).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn huge_declared_bmp_is_refused() {
+        // A 54-byte header claiming 100000×100000 at 24 bpp: 30 GB decoded.
+        let mut b = bmp(1, 1);
+        b[18..22].copy_from_slice(&100_000u32.to_le_bytes());
+        b[22..26].copy_from_slice(&100_000u32.to_le_bytes());
+        let t = std::time::Instant::now();
+        assert!(Image::decode(&b).is_none());
+        assert!(Image::decode(&bmp(MAX_SHEET_DIM + 1, 1)).is_none());
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+        assert!(Image::decode(&bmp(275, 116)).is_some());
+    }
+
+    #[test]
+    fn zip_total_is_bounded() {
+        // 15 wanted sheets of just under 8 MB each (they deflate to a few KB):
+        // 120 MB unpacked, more than the archive budget.
+        let big = vec![0u8; (MAX_ENTRY - 1) as usize];
+        let oversized = vec![0u8; (MAX_ENTRY + 1) as usize];
+        let names: Vec<String> = (0..5).map(|i| format!("x{i}/region.txt")).collect();
+        // Unused files are never inflated; entries declared oversized are
+        // skipped without inflating them.
+        let mut entries: Vec<(&str, &[u8])> = vec![("readme.png", &big)];
+        entries.extend(names.iter().map(|n| (n.as_str(), &oversized[..])));
+        entries.extend(Sheet::ALL.iter().map(|s| (s.file(), &big[..])));
+        let z = zip_of(&entries);
+        let t = std::time::Instant::now();
+        let files = read_zip_files(&z).unwrap();
+        assert!(t.elapsed() < std::time::Duration::from_secs(5));
+        assert!(!files.contains_key("region.txt"));
+        let total: usize = files.values().map(Vec::len).sum();
+        assert!(total as u64 <= MAX_TOTAL, "{total}");
+        // Four sheets fit the budget; the fifth ran it out.
+        assert_eq!(files.len(), 4);
+    }
+
+    #[test]
+    fn zip_keeps_only_used_files() {
+        let main = bmp(275, 116);
+        let z = zip_of(&[
+            ("Skin/Main.BMP", &main),
+            ("skin/readme.txt", b"hi"),
+            ("skin/extra.bmp", &main),
+            ("skin/region.txt", b""),
+        ]);
+        let files = read_zip_files(&z).unwrap();
+        let mut names: Vec<_> = files.keys().cloned().collect();
+        names.sort();
+        assert_eq!(names, ["main.bmp", "region.txt"]);
+        assert!(Skin::from_wsz("x", &z).unwrap().has_main());
+    }
+
+    #[test]
+    fn folder_walk_skips_symlinks_and_deep_dirs() {
+        let dir = std::env::temp_dir().join(format!("llama-test-folder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a/b/c")).unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("loop")).unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("a/b/loop")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", dir.join("pledit.txt")).unwrap();
+        std::fs::write(dir.join("a/b/main.bmp"), bmp(275, 116)).unwrap();
+        std::fs::write(dir.join("a/b/c/viscolor.txt"), b"1,2,3").unwrap();
+        std::fs::write(dir.join("a/notes.txt"), b"hi").unwrap();
+        let files = read_dir_files(&dir).unwrap();
+        let mut names: Vec<_> = files.keys().cloned().collect();
+        names.sort();
+        assert_eq!(names, ["main.bmp"]);
+        assert!(Skin::load(&dir).unwrap().has_main());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -3,8 +3,9 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::process::Child;
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
@@ -122,14 +123,23 @@ fn player(args: &[String]) -> Result<()> {
         st.save()?;
     }
 
-    // One window at a time: a second launch focuses the first.
-    if send_control("show").is_some() {
-        // A minimized window maps again asynchronously; give it a moment
-        // before asking Hyprland to focus it.
-        std::thread::sleep(Duration::from_millis(150));
-        focus_existing();
-        return Ok(());
-    }
+    // One window at a time: a second launch shows and focuses the first.
+    // The lock settles two launches at once (a double click); whoever holds
+    // it owns the control socket, so a stale socket file is safe to remove.
+    let _lock = loop {
+        if let Some(lock) = instance_lock()? {
+            break lock;
+        }
+        if send_control("show").is_some() {
+            // A minimized window maps again asynchronously; give it a
+            // moment before asking Hyprland to focus it.
+            std::thread::sleep(Duration::from_millis(150));
+            focus_existing();
+            return Ok(());
+        }
+        // The other launch is still starting up.
+        std::thread::sleep(Duration::from_millis(200));
+    };
     let _ = std::fs::remove_file(control_path());
     let listener = UnixListener::bind(control_path()).context("control socket")?;
 
@@ -146,6 +156,9 @@ fn player(args: &[String]) -> Result<()> {
     }
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
+            // A client that connects and says nothing must not wedge the
+            // socket for everyone after it.
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
             let mut line = String::new();
             let mut r = BufReader::new(&stream);
             if r.read_line(&mut line).is_err() {
@@ -164,11 +177,34 @@ fn player(args: &[String]) -> Result<()> {
 
     // OmaAmp's rule, and Winamp's: closing the player stops the music, but
     // only a cliamp this window started. A TUI the user opened is theirs.
-    let started = if engine && !llama::cliamp::is_running() {
-        start_engine()
-    } else {
-        None
-    };
+    let started: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+    if engine {
+        if !llama::cliamp::is_running() {
+            *started.lock().unwrap() = start_engine();
+        }
+        // Llama needs an engine: if cliamp goes away (it crashed, or the
+        // TUI it was attached to quit), start one of its own.
+        let started = started.clone();
+        std::thread::spawn(move || {
+            let mut missing = 0;
+            loop {
+                std::thread::sleep(Duration::from_secs(2));
+                if llama::cliamp::is_running() {
+                    missing = 0;
+                    continue;
+                }
+                missing += 1;
+                if missing >= 2 {
+                    missing = 0;
+                    let mut owned = started.lock().unwrap();
+                    if let Some(mut old) = owned.take() {
+                        let _ = old.try_wait();
+                    }
+                    *owned = start_engine();
+                }
+            }
+        });
+    }
 
     let result = llama::wl::run(llama::wl::Opts {
         base,
@@ -177,6 +213,7 @@ fn player(args: &[String]) -> Result<()> {
         hide: hide_src,
     });
 
+    let started = started.lock().unwrap().take();
     if let Some(mut child) = started {
         // Signal it only while it is still our child: once reaped, its pid
         // could belong to anyone.
@@ -210,19 +247,40 @@ fn load_base() -> Skin {
     })
 }
 
-/// Starts `cliamp -d` in its own session and waits for its socket.
+/// Takes the single-instance lock, or `None` if another Llama holds it.
+fn instance_lock() -> Result<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd;
+    let path = store::runtime_dir().join("llama.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let r = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    Ok((r == 0).then_some(file))
+}
+
 /// Starts `cliamp -d` and returns it while it is the daemon serving the
 /// socket. One that exits at once (another cliamp got there first) is reaped
 /// and not claimed.
 fn start_engine() -> Option<std::process::Child> {
     use std::os::unix::process::CommandExt;
-    let child = Command::new("cliamp")
-        .arg("-d")
+    let mut cmd = Command::new("cliamp");
+    cmd.arg("-d")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .process_group(0)
-        .spawn();
+        .process_group(0);
+    // If Llama dies without cleaning up (a crash, SIGKILL), the kernel stops
+    // the daemon too, instead of leaving music playing with no window.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
+    let child = cmd.spawn();
     let child = match child {
         Ok(c) => c,
         Err(e) => {
@@ -258,9 +316,16 @@ fn page_arg(args: &[String]) -> usize {
         .unwrap_or(0)
 }
 
+/// Museum results for the bar, keeping only entries whose md5 and
+/// screenshot look like the Museum's own (they are fetched and worn as-is).
 fn listing(refs: Vec<museum::SkinRef>) -> Value {
+    let ok = |r: &&museum::SkinRef| {
+        r.md5.len() == 32
+            && r.md5.bytes().all(|b| b.is_ascii_hexdigit())
+            && r.screenshot_url.starts_with("https://r2.webampskins.org/")
+    };
     json!({
-        "skins": refs.iter().map(|r| json!({
+        "skins": refs.iter().filter(ok).map(|r| json!({
             "md5": r.md5,
             "name": r.name(),
             "screenshot": r.screenshot_url,
@@ -289,10 +354,12 @@ fn skin_cmd(args: &[String]) -> Result<()> {
             print(listing(cached_featured(page)?));
         }
         Some("search") => {
-            let q = args
-                .get(1)
-                .filter(|q| !q.starts_with("--"))
-                .context("llama skin search <text>")?;
+            // `--` ends the options, for a search that starts with dashes.
+            let q = match args.get(1).map(String::as_str) {
+                Some("--") => args.get(2),
+                _ => args.get(1).filter(|q| !q.starts_with("--")),
+            }
+            .context("llama skin search [--] <text>")?;
             print(listing(museum::search(q, PAGE, page_arg(args) * PAGE)?));
         }
         Some("list") => {
@@ -300,7 +367,9 @@ fn skin_cmd(args: &[String]) -> Result<()> {
             if let Ok(dir) = std::fs::read_dir(store::skins_dir()) {
                 for e in dir.flatten() {
                     let p = e.path();
-                    if p.extension().is_some_and(|x| x == "wsz") {
+                    // Archives, and folders a dropped folder skin was copied to.
+                    let folder = e.file_type().is_ok_and(|t| t.is_dir());
+                    if folder || p.extension().is_some_and(|x| x == "wsz") {
                         let name = std::fs::read_to_string(p.with_extension("name"))
                             .unwrap_or_else(|_| {
                                 p.file_stem()

@@ -1,0 +1,19 @@
+#!/bin/bash
+# Serves release downloads from $FAKE_RELEASE_DIR, by file name; honours
+# -o and --max-filesize like curl (exit 63 when larger, 22 when missing).
+echo "curl $*" >> "${FAKE_LOG:-/dev/null}"
+out= max= url=
+while (( $# )); do
+  case $1 in
+    -o) out=$2; shift ;;
+    --max-filesize) max=$2; shift ;;
+    --proto | --connect-timeout | --max-time | --speed-limit | --speed-time) shift ;;
+    -*) ;;
+    *) url=$1 ;;
+  esac
+  shift
+done
+src="${FAKE_RELEASE_DIR:?}/${url##*/}"
+[[ -f $src ]] || exit 22
+if [[ -n $max ]] && (( $(stat -c %s "$src") > max )); then exit 63; fi
+cp "$src" "$out"

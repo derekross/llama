@@ -1,0 +1,4 @@
+#!/bin/sh
+# A `llama` on PATH that isn't the one under test (never expected to run).
+echo "PATH-llama $*" >> "${FAKE_LOG:-/dev/null}"
+exit 0

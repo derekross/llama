@@ -67,7 +67,11 @@ impl Ui {
                 {
                     return 12.0 - v * 24.0;
                 }
-                live.snap.eq_bands.get(b).copied().unwrap_or(0.0)
+                // While off, the sliders show the curve that ON brings back.
+                match &self.view.eq_saved {
+                    Some(saved) => saved.get(b).copied().unwrap_or(0.0),
+                    None => live.snap.eq_bands.get(b).copied().unwrap_or(0.0),
+                }
             })
             .collect();
 
@@ -103,11 +107,11 @@ impl Ui {
                     .unwrap_or(0xFF00FF00)
             })
             .collect();
-        let shown: Vec<f64> = if eq_on { bands.clone() } else { vec![0.0; 10] };
+        let shown = &bands;
         let mut prev: Option<i32> = None;
         for x in 0..113 {
             let pos = x as f64 * 9.0 / 112.0;
-            let v = catmull(&shown, pos);
+            let v = catmull(shown, pos);
             let y = (ratio(v) * 18.0).round() as i32;
             let (a, b) = match prev {
                 Some(p) if (p - y).abs() > 1 => (p.min(y), p.max(y)),
@@ -161,12 +165,14 @@ impl Ui {
                 vec![0.0; 10]
             }
         };
-        bands
+        let mut out: Vec<Action> = bands
             .iter()
             .enumerate()
             .filter(|(b, v)| live.snap.eq_bands.get(*b) != Some(v))
             .map(|(b, v)| op("eq", json!({"band": b, "value": v})))
-            .collect()
+            .collect();
+        out.push(Action::Save);
+        out
     }
 }
 
@@ -200,23 +206,35 @@ mod tests {
 
     #[test]
     fn eq_on_off_round_trip() {
-        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/skins/base-2.91.wsz");
-        let mut ui = Ui::new(
-            crate::skin::Skin::load(&p).unwrap(),
-            super::super::View::default(),
-        );
+        let skin = crate::skin::test_skin("base-2.91").unwrap_or_default();
+        let mut ui = Ui::new(skin, super::super::View::default());
         let mut live = Live::default();
         live.snap.eq_bands = vec![0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -2.0];
         let off = ui.eq_on_toggle(&live);
-        assert_eq!(off.len(), 2);
+        // Two bands flatten, then the saved curve is persisted.
+        assert_eq!(off.len(), 3);
+        assert_eq!(off[2], Action::Save);
         live.snap.eq_bands = vec![0.0; 10];
         let on = ui.eq_on_toggle(&live);
         assert_eq!(
             on,
             vec![
                 op("eq", json!({"band": 1, "value": 3.0})),
-                op("eq", json!({"band": 9, "value": -2.0}))
+                op("eq", json!({"band": 9, "value": -2.0})),
+                Action::Save
             ]
         );
+    }
+
+    #[test]
+    fn drags_while_off_shape_the_saved_curve() {
+        let skin = crate::skin::test_skin("base-2.91").unwrap_or_default();
+        let mut ui = Ui::new(skin, super::super::View::default());
+        let live = Live::default();
+        ui.view.eq_saved = Some(vec![0.0; 10]);
+        let top = ui.layout().eq.unwrap().y + sp::EQ_SLIDER_Y + 5;
+        let a = ui.slider_drag(&live, Target::EqBand(2), 0, top);
+        assert_eq!(a, vec![Action::Save]);
+        assert_eq!(ui.view.eq_saved.as_ref().unwrap()[2], 12.0);
     }
 }

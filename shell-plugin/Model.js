@@ -65,3 +65,46 @@ function status(text) {
 function repeatOn(r) {
   return r !== "" && String(r).toLowerCase() !== "off"
 }
+
+// A bar label: long titles would stretch the bar without limit.
+function shortTitle(t, max) {
+  var s = String(t || "")
+  var n = max || 30
+  return s.length > n ? s.substring(0, n - 1).trim() + "…" : s
+}
+
+function isMd5(s) {
+  return /^[0-9a-f]{32}$/i.test(String(s || ""))
+}
+
+// The Museum listing is remote data: only a real md5 may reach `llama skin
+// use` (which also takes paths and links), and only the Museum's own image
+// host may reach Image.source.
+function validSkins(list) {
+  if (!Array.isArray(list)) return []
+  return list.filter(function(s) {
+    return s && isMd5(s.md5)
+      && typeof s.screenshot === "string"
+      && s.screenshot.indexOf("https://r2.webampskins.org/") === 0
+  })
+}
+
+// `llama skin featured|search` failures, from its stderr ("llama: ...").
+function skinError(err) {
+  var e = String(err || "").trim().replace(/^llama:\s*/, "")
+  if (e === "") return "The Skin Museum is unreachable"
+  if (/unreachable/i.test(e)) return "The Skin Museum is unreachable"
+  if (/^Skin Museum:/.test(e)) return "The Museum could not run that search; try other words"
+  return e.split("\n")[0]
+}
+
+function firstLine(text) {
+  return String(text || "").trim().replace(/^llama:\s*/, "").split("\n")[0]
+}
+
+// A `remote call --wait` that finished without error, result or not.
+function callOk(text) {
+  var r = parse(text)
+  if (!r || r.ok === false) return false
+  return !r.job || r.job.state === "succeeded"
+}

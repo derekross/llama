@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "update-desktop-database $*" >> "${FAKE_LOG:-/dev/null}"
+exit 0

@@ -4,10 +4,11 @@
 mod eq;
 pub mod font;
 mod main_win;
+pub mod menu;
 mod playlist;
 
 use std::collections::BTreeSet;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -33,6 +34,37 @@ pub enum Action {
     Zoom,
     /// Ask the engine for data the UI will read back from `Live::replies`.
     Query(String, String, Value),
+    /// Open the main menu at a canvas point.
+    OpenMenu(i32, i32),
+    /// Ask for files or a folder with the desktop's file chooser.
+    PickFiles(Pick),
+    /// Show the window on every workspace (Hyprland's pin), or stop.
+    Pin(bool),
+    /// Open the bar panel's skin browser.
+    SkinBrowser,
+    /// Go back to the base skin.
+    BaseSkin,
+    /// Persist the view (a toggle that changes no size).
+    Save,
+}
+
+/// What a file chooser is for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Pick {
+    /// Replace the playlist and play (eject, L).
+    Play,
+    /// Append files (ADD → FILE).
+    AddFiles,
+    /// Append a folder's tracks (ADD → DIR, Shift+L).
+    AddFolder,
+}
+
+/// Modifier keys held during a key or click.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Mods {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
 }
 
 pub fn op(name: &str, params: Value) -> Action {
@@ -71,6 +103,8 @@ pub enum Target {
     PlScroll,
     PlResize,
     PlMenu(PlMenuKind),
+    /// The playlist's mini transport, 0..=5 like `Transport`.
+    PlTransport(usize),
     ShadeSeek,
 }
 
@@ -85,6 +119,7 @@ pub struct Prompt {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PromptKind {
     AddLocation,
+    PlayLocation,
     SavePlaylist,
 }
 
@@ -126,6 +161,16 @@ pub struct View {
     pub chooser: Option<Chooser>,
     pub eq_saved: Option<Vec<f64>>,
     pub last_title_click: Option<Instant>,
+    /// Double size (clutterbar D): the zoom is twice the base zoom.
+    pub double: bool,
+    /// Shown on every workspace (clutterbar A).
+    pub pinned: bool,
+    /// The playlist has the keyboard: arrows move the selection.
+    pub pl_focus: bool,
+    /// Where a Shift-click range starts.
+    pub pl_anchor: Option<usize>,
+    /// A short message that takes over the marquee for a moment.
+    pub note: Option<(String, Instant)>,
 }
 
 impl Default for View {
@@ -151,6 +196,11 @@ impl Default for View {
             chooser: None,
             eq_saved: None,
             last_title_click: None,
+            double: false,
+            pinned: false,
+            pl_focus: false,
+            pl_anchor: None,
+            note: None,
         }
     }
 }
@@ -165,6 +215,7 @@ pub struct Ui {
     peaks: [f32; 19],
     bars: [f32; 19],
     masks: Masks,
+    menu_font: Option<font::PlFont>,
 }
 
 #[derive(Default)]
@@ -194,6 +245,7 @@ impl Ui {
             peaks: [0.0; 19],
             bars: [0.0; 19],
             masks: Masks::default(),
+            menu_font: None,
         };
         ui.build_masks();
         ui
@@ -306,9 +358,34 @@ impl Ui {
     }
 
     /// Whether anything animates, so the window knows to keep drawing.
+    ///
+    /// Only what moves faster than once a second counts: the visualizer, a
+    /// scrolling marquee, a busy notice, a blinking paused clock.
     pub fn animating(&self, live: &Live) -> bool {
         let scrolling = self.marquee_text.chars().count() as i32 * sp::CHAR_W > sp::MARQUEE.w;
-        live.snap.playing() || live.busy() || scrolling || self.peaks.iter().any(|&p| p > 0.0)
+        let vis = self.view.vis_on && (live.snap.playing() || self.peaks.iter().any(|&p| p > 0.0));
+        vis || scrolling || live.busy() || live.snap.paused() || self.view.note.is_some()
+    }
+
+    /// Forgets the visualizer's bars, so a hidden or switched-off visualizer
+    /// does not keep the window animating.
+    pub fn clear_vis(&mut self) {
+        self.peaks = [0.0; 19];
+        self.bars = [0.0; 19];
+    }
+
+    /// Shows `text` in the marquee for a few seconds.
+    pub fn note(&mut self, text: impl Into<String>) {
+        self.view.note = Some((text.into(), Instant::now()));
+    }
+
+    /// The zoom a toggle of double size lands on.
+    fn toggled_zoom(&self) -> i32 {
+        if self.view.double {
+            (self.view.zoom / 2).max(1)
+        } else {
+            self.view.zoom * 2
+        }
     }
 
     // ---- input -------------------------------------------------------------
@@ -327,8 +404,9 @@ impl Ui {
         None
     }
 
-    pub fn pointer_down(&mut self, live: &Live, x: i32, y: i32) -> Vec<Action> {
+    pub fn pointer_down(&mut self, live: &Live, x: i32, y: i32, mods: Mods) -> Vec<Action> {
         self.view.hover = (x, y);
+        self.view.pl_focus = self.layout().pl.is_some_and(|r| r.contains(x, y));
         // An open chooser or prompt takes every click.
         if self.view.chooser.is_some() || self.view.prompt.is_some() {
             return self.overlay_click(x, y);
@@ -370,13 +448,33 @@ impl Ui {
             | Target::EqBand(_) => {
                 out.extend(self.slider_drag(live, t, x, y));
             }
-            Target::PlRow(i) => out.extend(self.pl_row_click(i)),
+            Target::PlRow(i) => out.extend(self.pl_row_click(i, mods)),
             Target::PlScroll => out.extend(self.pl_scroll_drag(live, y)),
             Target::PlResize => self.view.pl_resize_from = Some((y, self.view.pl_h)),
             Target::PlMenu(kind) => self.view.pl_menu = Some(kind),
+            // The menu opens on press, as Winamp's did.
+            Target::Options | Target::Clutter(0) => {
+                self.view.press = None;
+                out.push(Action::OpenMenu(x, y));
+            }
             _ => {}
         }
         out
+    }
+
+    /// A right click anywhere opens the main menu.
+    pub fn pointer_menu(&mut self, x: i32, y: i32) -> Vec<Action> {
+        self.view.pl_menu = None;
+        self.view.press = None;
+        vec![Action::OpenMenu(x, y)]
+    }
+
+    /// The pointer left the window mid-gesture (a compositor bind took it):
+    /// drop the gesture rather than leave a slider stuck to the pointer.
+    pub fn pointer_lost(&mut self) {
+        self.view.press = None;
+        self.view.drag = None;
+        self.view.pl_resize_from = None;
     }
 
     pub fn pointer_move(&mut self, live: &Live, x: i32, y: i32) -> Vec<Action> {
@@ -451,6 +549,7 @@ impl Ui {
     fn click(&mut self, live: &Live, t: Target) -> Vec<Action> {
         let s = &live.snap;
         match t {
+            Target::PlTransport(i) => self.click(live, Target::Transport(i)),
             Target::Transport(0) => vec![op("prev", json!({}))],
             Target::Transport(1) => {
                 if s.paused() {
@@ -462,13 +561,19 @@ impl Ui {
                     vec![op("play", json!({}))]
                 }
             }
-            Target::Transport(2) => vec![op("toggle", json!({}))],
+            // Pause pauses or resumes; on a stopped player it does nothing.
+            Target::Transport(2) => {
+                if s.playing() {
+                    vec![op("pause", json!({}))]
+                } else if s.paused() {
+                    vec![op("play", json!({}))]
+                } else {
+                    vec![]
+                }
+            }
             Target::Transport(3) => vec![op("stop", json!({}))],
             Target::Transport(4) => vec![op("next", json!({}))],
-            Target::Transport(5) => {
-                self.open_prompt(PromptKind::AddLocation);
-                vec![Action::Resize]
-            }
+            Target::Transport(5) => vec![Action::PickFiles(Pick::Play)],
             Target::Shuffle => vec![op("shuffle", json!({"name": "toggle"}))],
             Target::Repeat => {
                 vec![op(
@@ -486,18 +591,31 @@ impl Ui {
             }
             Target::Time => {
                 self.view.time_remaining = !self.view.time_remaining;
-                vec![]
+                vec![Action::Save]
             }
-            Target::Vis => {
+            Target::Vis | Target::Clutter(4) => {
                 self.view.vis_on = !self.view.vis_on;
+                if !self.view.vis_on {
+                    self.clear_vis();
+                }
+                vec![Action::Save]
+            }
+            Target::Clutter(1) => {
+                self.view.pinned = !self.view.pinned;
+                self.note(if self.view.pinned {
+                    "Shown on every workspace"
+                } else {
+                    "Shown on this workspace only"
+                });
+                vec![Action::Pin(self.view.pinned), Action::Save]
+            }
+            Target::Clutter(2) => {
+                self.note(track_info(live));
                 vec![]
             }
             Target::Clutter(3) => {
-                self.view.zoom = if self.view.zoom >= 4 {
-                    2
-                } else {
-                    self.view.zoom * 2
-                };
+                self.view.zoom = self.toggled_zoom();
+                self.view.double = !self.view.double;
                 vec![Action::Zoom]
             }
             Target::Shade => {
@@ -519,38 +637,70 @@ impl Ui {
                 self.open_eq_presets(live);
                 vec![Action::Resize]
             }
+            Target::EqAuto => {
+                self.note("EQ auto-load: cliamp keeps one EQ for every track");
+                vec![]
+            }
             _ => vec![],
         }
     }
 
-    pub fn scroll(&mut self, live: &Live, x: i32, y: i32, dy: f64) -> Vec<Action> {
+    /// `steps` wheel notches, positive downwards.
+    pub fn scroll(&mut self, live: &Live, x: i32, y: i32, steps: i32) -> Vec<Action> {
         let l = self.layout();
         if let Some(r) = l.pl.filter(|r| r.contains(x, y)) {
             let rows = live.queue.len();
             let visible = self.pl_visible_rows(r) as usize;
             let max = rows.saturating_sub(visible);
-            let step = if dy > 0.0 { 3 } else { -3 };
-            self.view.pl_scroll = (self.view.pl_scroll as i64 + step).clamp(0, max as i64) as usize;
+            self.view.pl_scroll =
+                (self.view.pl_scroll as i64 + 3 * steps as i64).clamp(0, max as i64) as usize;
             return vec![];
         }
-        let delta = if dy > 0.0 { -1.0 } else { 1.0 };
-        vec![op("volume.adjust", json!({"value": delta}))]
+        vec![op("volume.adjust", json!({"value": -steps}))]
     }
 
     // ---- keyboard ------------------------------------------------------------
 
-    /// Winamp's classic keys. `text` is the typed character, if any.
-    pub fn key(&mut self, live: &Live, key: Key, text: Option<&str>, ctrl: bool) -> Vec<Action> {
+    /// Winamp's classic keys. `ch` is the key's character with no modifier
+    /// applied (so Ctrl+D is 'd'); `text` is what it types, for the prompt.
+    pub fn key(
+        &mut self,
+        live: &Live,
+        key: Key,
+        ch: Option<char>,
+        text: Option<&str>,
+        mods: Mods,
+    ) -> Vec<Action> {
         if self.view.prompt.is_some() {
             return self.prompt_key(live, key, text);
         }
         if self.view.chooser.is_some() {
             return self.chooser_key(key);
         }
-        if ctrl {
-            return match text.map(|t| t.to_ascii_lowercase()).as_deref() {
-                Some("d") => self.click(live, Target::Clutter(3)),
-                Some("w") => self.click(live, Target::Shade),
+        let ch = ch.map(|c| c.to_ascii_lowercase());
+        if self.view.pl_focus
+            && self.view.pl_open
+            && let Some(a) = self.pl_key(live, key, ch, mods)
+        {
+            return a;
+        }
+        if mods.ctrl {
+            return match ch {
+                Some('d') => self.click(live, Target::Clutter(3)),
+                Some('w') => self.click(live, Target::Shade),
+                Some('a') => self.click(live, Target::Clutter(1)),
+                Some('l') => {
+                    self.open_prompt(PromptKind::PlayLocation);
+                    vec![Action::Resize]
+                }
+                _ => vec![],
+            };
+        }
+        if mods.alt {
+            return match ch {
+                Some('g') => self.click(live, Target::EqToggle),
+                Some('e') => self.click(live, Target::PlToggle),
+                Some('w') => self.click(live, Target::Shade),
                 _ => vec![],
             };
         }
@@ -568,20 +718,38 @@ impl Ui {
                 Some(&i) => vec![op("queue.play", json!({"index": i}))],
                 None => vec![],
             },
-            _ => match text.map(|t| t.to_ascii_lowercase()).as_deref() {
-                Some("z") => self.click(live, Target::Transport(0)),
-                Some("x") => self.click(live, Target::Transport(1)),
-                Some("c") => self.click(live, Target::Transport(2)),
-                Some("v") => self.click(live, Target::Transport(3)),
-                Some("b") => self.click(live, Target::Transport(4)),
-                Some("l") => self.click(live, Target::Transport(5)),
-                Some("s") => self.click(live, Target::Shuffle),
-                Some("r") => self.click(live, Target::Repeat),
-                Some("g") => self.click(live, Target::EqToggle),
-                Some("e") => self.click(live, Target::PlToggle),
+            _ => match ch {
+                Some('z') => self.click(live, Target::Transport(0)),
+                Some('x') => self.click(live, Target::Transport(1)),
+                Some('c') => self.click(live, Target::Transport(2)),
+                Some('v') => self.click(live, Target::Transport(3)),
+                Some('b') => self.click(live, Target::Transport(4)),
+                Some('l') if mods.shift => vec![Action::PickFiles(Pick::AddFolder)],
+                Some('l') => self.click(live, Target::Transport(5)),
+                Some('s') => self.click(live, Target::Shuffle),
+                Some('r') => self.click(live, Target::Repeat),
+                Some('g') => self.click(live, Target::EqToggle),
+                Some('e') => self.click(live, Target::PlToggle),
                 _ => vec![],
             },
         }
+    }
+
+    /// Whether a held key should repeat: navigation and editing do, toggles
+    /// and transport do not (holding L must not type "lll" into the prompt it
+    /// opened).
+    pub fn repeats(&self, key: Key, was_prompt: bool) -> bool {
+        was_prompt
+            || matches!(
+                key,
+                Key::Up
+                    | Key::Down
+                    | Key::Left
+                    | Key::Right
+                    | Key::PageUp
+                    | Key::PageDown
+                    | Key::Backspace
+            )
     }
 
     // ---- overlays (prompt, chooser) ---------------------------------------
@@ -589,6 +757,7 @@ impl Ui {
     pub fn open_prompt(&mut self, kind: PromptKind) {
         let title = match kind {
             PromptKind::AddLocation => "Add file, folder or URL:",
+            PromptKind::PlayLocation => "Play URL or file:",
             PromptKind::SavePlaylist => "Save playlist as:",
         };
         self.view.chooser = None;
@@ -628,6 +797,12 @@ impl Ui {
                 }
                 return match p.kind {
                     PromptKind::AddLocation => vec![op("queue", json!({"path": text}))],
+                    // Winamp's "Play location" replaces the list and plays.
+                    PromptKind::PlayLocation => vec![
+                        op("queue.clear", json!({})),
+                        op("queue", json!({"path": text})),
+                        op("queue.play", json!({"index": 0})),
+                    ],
                     PromptKind::SavePlaylist => vec![op(
                         "playlist.replace",
                         json!({"provider": "local", "playlist": text, "tracks": live.queue_raw}),
@@ -669,7 +844,11 @@ impl Ui {
                 "provider.load",
                 json!({"provider": "local", "playlist": item}),
             )],
-            ChooserKind::EqPreset => vec![op("eq", json!({"name": item}))],
+            // Picking a preset turns the EQ back on.
+            ChooserKind::EqPreset => {
+                self.view.eq_saved = None;
+                vec![op("eq", json!({"name": item})), Action::Save]
+            }
         }
     }
 
@@ -740,8 +919,33 @@ pub enum Key {
     Escape,
     Backspace,
     Delete,
+    PageUp,
+    PageDown,
+    Home,
+    End,
     Other,
 }
+
+/// The current track's details, for the clutterbar I.
+fn track_info(live: &Live) -> String {
+    let Some(t) = live.snap.now() else {
+        return "No track".into();
+    };
+    let mut parts = vec![t.display()];
+    if !t.album.is_empty() {
+        parts.push(t.album.clone());
+    }
+    if live.snap.duration > 0.0 {
+        parts.push(clock(live.snap.duration));
+    }
+    if !t.path.is_empty() {
+        parts.push(t.path.clone());
+    }
+    parts.join("  *  ")
+}
+
+/// How long a note holds the marquee.
+pub const NOTE_FOR: Duration = Duration::from_secs(4);
 
 fn expand_home(p: &str) -> String {
     if let Some(rest) = p.strip_prefix("~/")

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stands in for cliamp: the tests must never reach a real cliamp daemon.
+echo "cliamp $*" >> "${FAKE_LOG:-/dev/null}"
+exit 0

@@ -1,0 +1,11 @@
+#!/bin/sh
+# Logs the call and "builds" a placeholder binary into the target folder.
+echo "cargo $* CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-unset} PWD=$PWD" >> "${FAKE_LOG:-/dev/null}"
+case " $* " in *" build "*) ;; *) exit 0 ;; esac
+target=${CARGO_TARGET_DIR:-$PWD/target}
+case $target in
+  "$SANDBOX"/*) ;;
+  *) echo "cargo stub: refusing to write outside the sandbox ($target)" >&2; exit 1 ;;
+esac
+mkdir -p "$target/release"
+cp "$BINS/release/llama" "$target/release/llama"

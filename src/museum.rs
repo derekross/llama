@@ -17,7 +17,7 @@ const UA: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (+https://github.com/derekross/llama)"
 );
-const MAX_SKIN: u64 = 16 << 20;
+const MAX_SKIN: u64 = crate::skin::MAX_WSZ;
 pub const BASE_MD5: &str = "2f245e741b6bd4e1a122a28489f0c7b7";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -111,7 +111,12 @@ fn download(url: &str) -> Result<Vec<u8>> {
     {
         bail!("refusing to download from {url}");
     }
-    let resp = agent()
+    // No redirects: they could lead off the hosts checked above.
+    let resp = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(30))
+        .user_agent(UA)
+        .redirects(0)
+        .build()
         .get(url)
         .call()
         .with_context(|| format!("downloading {url}"))?;
@@ -125,13 +130,33 @@ fn download(url: &str) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Checks that `bytes` are the Museum skin `md5` (the Museum's md5 is the
+/// file's) and that it is usable: an error page or a truncated download is
+/// never kept.
+fn verify(md5: &str, bytes: &[u8]) -> Result<()> {
+    let got = md5_hex(bytes);
+    if got != md5 {
+        bail!("download of {md5} came back as {got}");
+    }
+    let skin = crate::skin::Skin::from_wsz(md5, bytes)?;
+    if !skin.has_main() {
+        bail!("{md5} has no readable main.bmp");
+    }
+    Ok(())
+}
+
+/// Whether the file at `path` is the Museum skin `md5`.
+fn on_disk_ok(path: &std::path::Path, md5: &str) -> bool {
+    crate::skin::read_capped(path, MAX_SKIN).is_ok_and(|b| verify(md5, &b).is_ok())
+}
+
 /// Downloads a Museum skin into the skins folder (once) and returns its path
 /// and display name.
 pub fn install(md5: &str) -> Result<(PathBuf, String)> {
     let dir = store::skins_dir();
     let path = dir.join(format!("{md5}.wsz"));
     let name_path = dir.join(format!("{md5}.name"));
-    if path.exists() {
+    if on_disk_ok(&path, md5) {
         let name = std::fs::read_to_string(&name_path).unwrap_or_else(|_| md5.to_string());
         return Ok((path, name));
     }
@@ -142,20 +167,75 @@ pub fn install(md5: &str) -> Result<(PathBuf, String)> {
         r.download_url.clone()
     };
     let bytes = download(&url)?;
-    crate::skin::Skin::from_wsz(md5, &bytes).context("the Museum's file is not a usable skin")?;
+    verify(md5, &bytes).context("the Museum's file is not a usable skin")?;
     store::write_atomic(&path, &bytes)?;
-    let _ = std::fs::write(&name_path, r.name());
+    let _ = store::write_atomic(&name_path, r.name().as_bytes());
     Ok((path, r.name()))
 }
 
-/// Makes sure the base skin is on disk, fetching it on first run.
+/// Makes sure the base skin is on disk, fetching it on first run, or again
+/// if the copy there is not the base skin.
 pub fn ensure_base() -> Result<PathBuf> {
     let path = store::base_skin_path();
-    if !path.exists() {
+    if !on_disk_ok(&path, BASE_MD5) {
+        if path.exists() {
+            log::warn!("{} is damaged, fetching it again", path.display());
+            let _ = std::fs::remove_file(&path);
+        }
         let bytes = download(&format!("https://r2.webampskins.org/skins/{BASE_MD5}.wsz"))?;
+        verify(BASE_MD5, &bytes).context("the Museum's base skin is not usable")?;
         store::write_atomic(&path, &bytes)?;
     }
     Ok(path)
+}
+
+/// MD5 (RFC 1321) as lower-case hex. Only to match the Museum's file ids,
+/// not for anything security-sensitive beyond "is this the file we asked for".
+fn md5_hex(data: &[u8]) -> String {
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    let k: Vec<u32> = (0..64)
+        .map(|i| ((i as f64 + 1.0).sin().abs() * 4294967296.0) as u32)
+        .collect();
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&((data.len() as u64).wrapping_mul(8)).to_le_bytes());
+    let mut h: [u32; 4] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
+    for chunk in msg.as_chunks::<64>().0 {
+        let m: Vec<u32> = chunk
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
+            .collect();
+        let [mut a, mut b, mut c, mut d] = h;
+        for i in 0..64 {
+            let (f, g) = match i / 16 {
+                0 => ((b & c) | (!b & d), i),
+                1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                2 => (b ^ c ^ d, (3 * i + 5) % 16),
+                _ => (c ^ (b | !d), (7 * i) % 16),
+            };
+            let f = f.wrapping_add(a).wrapping_add(k[i]).wrapping_add(m[g]);
+            a = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(f.rotate_left(S[i]));
+        }
+        for (x, y) in h.iter_mut().zip([a, b, c, d]) {
+            *x = x.wrapping_add(y);
+        }
+    }
+    h.iter()
+        .flat_map(|x| x.to_le_bytes())
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -179,5 +259,34 @@ mod tests {
             Some(m)
         );
         assert_eq!(parse_md5("not-a-skin"), None);
+    }
+
+    #[test]
+    fn md5_matches_rfc_1321() {
+        assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(
+            md5_hex(
+                b"12345678901234567890123456789012345678901234567890123456789012345678901234567890"
+            ),
+            "57edf4a22be3c955ac49da2e2107b67a"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_wrong_bytes() {
+        assert!(verify(BASE_MD5, b"<html>not found</html>").is_err());
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/skins/base-2.91.wsz");
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!(
+                "skipping: {} is missing; run tests/fetch-skins.sh",
+                path.display()
+            );
+            return;
+        };
+        verify(BASE_MD5, &bytes).unwrap();
+        assert!(verify("4308a2fc648033bf5fe7c4d56a5c8823", &bytes).is_err());
+        assert!(on_disk_ok(&path, BASE_MD5));
     }
 }

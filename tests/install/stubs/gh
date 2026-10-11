@@ -1,0 +1,9 @@
+#!/bin/sh
+# `gh auth status` answers $FAKE_GH_AUTH (default: not signed in);
+# `gh attestation verify` answers $FAKE_GH_ATTEST.
+echo "gh $*" >> "${FAKE_LOG:-/dev/null}"
+case "$1 $2" in
+  "auth status") exit "${FAKE_GH_AUTH:-1}" ;;
+  "attestation verify") exit "${FAKE_GH_ATTEST:-0}" ;;
+esac
+exit 0

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::{Client, Snapshot, Track};
+use super::{Client, Snapshot, Track, job_outcome};
 
 #[derive(Clone, Debug, Default)]
 pub struct Live {
@@ -23,8 +23,8 @@ pub struct Live {
     pub queue: Vec<Track>,
     pub queue_raw: Vec<Value>,
     pub spectrum: Vec<f32>,
-    /// The last failed operation, for the marquee.
-    pub error: Option<String>,
+    /// Failed operations, for the window to show and clear.
+    pub errors: Vec<String>,
     /// Answers to `Engine::query`, as (tag, result), for the window to take.
     pub replies: Vec<(String, Value)>,
     /// When the request now waiting on cliamp was sent.
@@ -134,11 +134,24 @@ impl Worker {
                     }
                 }
             }
-            // Drain commands while disconnected so they do not replay later
-            // as a burst; a dead engine cannot act on them anyway.
-            match self.rx.recv_timeout(Duration::from_secs(1)) {
-                Err(RecvTimeoutError::Disconnected) => return,
-                _ => while self.rx.try_recv().is_ok() {},
+            // Commands wait in the channel for the next session: a session
+            // that ended because cliamp restarted, or after a long busy
+            // spell, must not lose the clicks made meanwhile. Only while
+            // nothing is listening at all are they dropped, so they do not
+            // replay as a burst much later.
+            std::thread::sleep(Duration::from_secs(1));
+            if !super::is_running() {
+                let mut dropped = 0;
+                loop {
+                    match self.rx.try_recv() {
+                        Ok(_) => dropped += 1,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                    }
+                }
+                if dropped > 0 {
+                    self.note("cliamp is not running".into());
+                }
             }
         }
     }
@@ -159,8 +172,41 @@ impl Worker {
         out
     }
 
+    /// Hands a failure to the window.
+    fn note(&self, text: String) {
+        self.live.lock().unwrap().errors.push(text);
+        (self.wake)();
+    }
+
+    /// Checks on submitted jobs, reporting the ones that failed. Jobs are
+    /// fire-and-forget for the window, but a bad path or a stale index
+    /// should not fail in silence.
+    fn check_jobs(&self, c: &mut Client, pending: &mut Vec<(String, String, Instant)>) {
+        let mut i = 0;
+        // A few per poll: each is a round trip.
+        let mut budget = 8;
+        while i < pending.len() && budget > 0 {
+            budget -= 1;
+            let (op, id, at) = &pending[i];
+            match c.job(id).ok().and_then(|j| job_outcome(op, &j)) {
+                Some(Err(e)) => {
+                    self.note(e.to_string());
+                    pending.remove(i);
+                }
+                Some(Ok(_)) => {
+                    pending.remove(i);
+                }
+                None if at.elapsed() > Duration::from_secs(600) => {
+                    pending.remove(i);
+                }
+                None => i += 1,
+            }
+        }
+    }
+
     /// Runs until the connection breaks (Ok) or the window is gone (Err).
     fn session(&self, mut c: Client) -> Result<(), ()> {
+        let mut pending: Vec<(String, String, Instant)> = Vec::new();
         let mut queue_rev = u64::MAX;
         let mut next_state = Instant::now();
         let mut next_spec = Instant::now();
@@ -200,6 +246,9 @@ impl Worker {
                 if changed {
                     (self.wake)();
                 }
+                if !pending.is_empty() {
+                    self.ask(&mut c, |c| self.check_jobs(c, &mut pending));
+                }
             }
             if self.want_spectrum.load(Ordering::Relaxed) && now >= next_spec {
                 next_spec = now + SPECTRUM_EVERY;
@@ -225,9 +274,17 @@ impl Worker {
             let wait = deadline.saturating_duration_since(Instant::now());
             match self.rx.recv_timeout(wait) {
                 Ok(Cmd::Op(name, params)) => {
-                    let result = self.ask(&mut c, |c| c.submit(&name, params));
-                    let err = result.as_ref().err().map(|e| e.to_string());
-                    self.live.lock().unwrap().error = err;
+                    match self.ask(&mut c, |c| c.submit(&name, params)) {
+                        Ok(job) => match job_outcome(&name, &job) {
+                            Some(Err(e)) => self.note(e.to_string()),
+                            Some(Ok(_)) => {}
+                            None => {
+                                let id = job["id"].as_str().unwrap_or_default().to_string();
+                                pending.push((name, id, Instant::now()));
+                            }
+                        },
+                        Err(e) => self.note(format!("{name}: {e}")),
+                    }
                     // See the effect right away instead of at the next poll.
                     next_state = Instant::now();
                 }
@@ -237,7 +294,7 @@ impl Worker {
                         let mut l = self.live.lock().unwrap();
                         match result {
                             Ok(v) => l.replies.push((tag, v)),
-                            Err(e) => l.error = Some(e.to_string()),
+                            Err(e) => l.errors.push(e.to_string()),
                         }
                     }
                     (self.wake)();

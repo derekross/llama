@@ -3,6 +3,7 @@
 pub mod cliamp;
 pub mod hypr;
 pub mod museum;
+pub mod picker;
 pub mod render;
 pub mod skin;
 pub mod skins;

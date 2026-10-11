@@ -8,9 +8,11 @@
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
+use smithay_client_toolkit::reexports::calloop::channel::{self, Channel};
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay_client_toolkit::reexports::calloop::{EventLoop, LoopHandle, ping};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
+use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_positioner;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     data_device_manager::{
@@ -20,8 +22,8 @@ use smithay_client_toolkit::{
         data_source::DataSourceHandler,
     },
     delegate_compositor, delegate_data_device, delegate_keyboard, delegate_output,
-    delegate_pointer, delegate_registry, delegate_seat, delegate_shm, delegate_xdg_shell,
-    delegate_xdg_window,
+    delegate_pointer, delegate_registry, delegate_seat, delegate_shm, delegate_xdg_popup,
+    delegate_xdg_shell, delegate_xdg_window,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -35,7 +37,8 @@ use smithay_client_toolkit::{
     shell::{
         WaylandSurface,
         xdg::{
-            XdgShell, XdgSurface,
+            XdgPositioner, XdgShell, XdgSurface,
+            popup::{Popup, PopupConfigure, PopupHandler},
             window::{Window, WindowConfigure, WindowDecorations, WindowHandler},
         },
     },
@@ -55,13 +58,24 @@ use wayland_protocols::wp::fractional_scale::v1::client::{
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 
-use crate::cliamp::engine::Engine;
+use crate::cliamp::engine::{Engine, Live};
 use crate::skin::Skin;
 use crate::store::{self, State};
-use crate::ui::{Action, Key, Ui, View};
+use crate::ui::{Action, Key, Mods, Pick, Ui, View};
 
 pub const APP_ID: &str = "llama";
 const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+
+/// Results that background threads hand back to the event loop.
+pub enum Msg {
+    Actions(Vec<Action>),
+    Note(String),
+    /// A skin loaded off the event loop, for load number `.0`.
+    Skin(u64, Box<Skin>),
+    /// No file chooser exists: ask for a typed path instead.
+    NoChooser,
+}
 
 pub struct Opts {
     pub base: Skin,
@@ -101,7 +115,10 @@ pub fn run(opts: Opts) -> Result<()> {
 
     let state = State::load();
     let view = View {
-        zoom: state.zoom.clamp(1, 8),
+        zoom: state.zoom.clamp(1, 8) * if state.double { 2 } else { 1 },
+        double: state.double,
+        pinned: state.pinned,
+        eq_saved: state.eq_saved.clone(),
         shaded: state.shaded,
         eq_open: state.eq_open,
         pl_open: state.pl_open,
@@ -128,13 +145,24 @@ pub fn run(opts: Opts) -> Result<()> {
         .insert_source(opts.hide, |_, _, app: &mut App| app.hide())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    let (msgs, msg_src): (channel::Sender<Msg>, Channel<Msg>) = channel::channel();
+    handle
+        .insert_source(msg_src, |event, _, app: &mut App| {
+            if let channel::Event::Msg(m) = event {
+                app.message(m);
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
     // Animation and housekeeping: ~30 fps while something moves, otherwise
-    // a slow tick that also notices skin changes made from the bar.
+    // a slow tick that keeps the clock current and notices skin changes
+    // made from the bar.
     handle
         .insert_source(Timer::immediate(), |_, _, app: &mut App| {
             app.tick();
-            let live = app.engine.live.lock().unwrap();
-            let fast = app.ui.animating(&live) || app.ui.view.press.is_some();
+            let live = app.engine.live.clone();
+            let live = live.lock().unwrap();
+            let fast = !app.hidden && (app.ui.animating(&live) || app.ui.view.press.is_some());
             drop(live);
             TimeoutAction::ToDuration(Duration::from_millis(if fast { 33 } else { 250 }))
         })
@@ -142,6 +170,7 @@ pub fn run(opts: Opts) -> Result<()> {
 
     window.commit();
 
+    let pool = SlotPool::new(275 * 116 * 4 * 4, &shm)?;
     let mut app = App {
         registry: RegistryState::new(&globals),
         seats: SeatState::new(&globals, &qh),
@@ -153,7 +182,7 @@ pub fn run(opts: Opts) -> Result<()> {
         shm,
         dnd,
         data_device: None,
-        pool: SlotPool::new(275 * 116 * 4 * 4, &Shm::bind(&globals, &qh)?)?,
+        pool,
         window,
         viewport,
         _fractional: fractional,
@@ -169,8 +198,14 @@ pub fn run(opts: Opts) -> Result<()> {
         seat: None,
         press_serial: 0,
         ptr: (0.0, 0.0),
-        ctrl: false,
+        mods: Mods::default(),
+        repeat_ok: false,
+        scroll_acc: (0, 0.0),
         set_cursor: false,
+        menu: None,
+        msgs,
+        skin_gen: 0,
+        last_clock: None,
         ui,
         engine,
         base: opts.base,
@@ -186,7 +221,7 @@ pub fn run(opts: Opts) -> Result<()> {
     while !app.exit {
         event_loop.dispatch(None, &mut app)?;
     }
-    app.save_state();
+    app.save_state(true);
     Ok(())
 }
 
@@ -244,6 +279,14 @@ pub fn load_skin(state: &State, base: &Skin) -> Skin {
     }
 }
 
+/// The main menu as an xdg popup, so it can hang outside the window.
+struct MenuPopup {
+    popup: Popup,
+    viewport: Option<wp_viewport::WpViewport>,
+    hover: Option<usize>,
+    configured: bool,
+}
+
 struct App {
     registry: RegistryState,
     seats: SeatState,
@@ -273,8 +316,19 @@ struct App {
     seat: Option<wl_seat::WlSeat>,
     press_serial: u32,
     ptr: (f64, f64),
-    ctrl: bool,
+    mods: Mods,
+    /// Whether the key now held may repeat (decided when it went down).
+    repeat_ok: bool,
+    /// Wheel travel not yet turned into steps: (value120, pixels).
+    scroll_acc: (i32, f64),
     set_cursor: bool,
+    /// The open main menu.
+    menu: Option<MenuPopup>,
+    msgs: channel::Sender<Msg>,
+    /// Bumped per skin load, so a slow, stale load is dropped.
+    skin_gen: u64,
+    /// The second the clock last showed, to redraw once it moves.
+    last_clock: Option<u64>,
     ui: Ui,
     engine: Engine,
     base: Skin,
@@ -293,13 +347,28 @@ impl App {
         self.ui.view.zoom.max(1)
     }
 
+    /// The scale as wp_fractional_scale's 120ths.
+    fn scale120(&self) -> i32 {
+        (self.scale * 120.0).round().max(1.0) as i32
+    }
+
+    /// The logical size that holds `px` physical pixels at this scale, and
+    /// that size back in physical pixels. The logical size is rounded up to
+    /// a length whose physical size is a whole number, so the viewport maps
+    /// buffer pixels 1:1 and nothing is resampled (at 1.5, an even length).
+    fn fit(&self, px: i32) -> (i32, i32) {
+        let n = self.scale120();
+        let step = 120 / gcd(n, 120);
+        let logical = (px * 120 + n - 1) / n;
+        let logical = (logical + step - 1) / step * step;
+        (logical, logical * n / 120)
+    }
+
     /// Surface-local (logical) position → skin pixel.
     fn skin_pos(&self, (x, y): (f64, f64)) -> (i32, i32) {
         let z = self.zoom() as f64;
-        (
-            (x * self.scale / z).floor() as i32,
-            (y * self.scale / z).floor() as i32,
-        )
+        let s = self.scale120() as f64 / 120.0;
+        ((x * s / z).floor() as i32, (y * s / z).floor() as i32)
     }
 
     /// Minimizes. Hyprland has no minimized state for a window to go to, so
@@ -311,7 +380,8 @@ impl App {
         if self.hidden {
             return;
         }
-        self.save_state();
+        self.close_menu();
+        self.save_state(true);
         let (window, viewport, fractional) = new_window(
             &self.compositor,
             &self.xdg,
@@ -329,7 +399,10 @@ impl App {
         self.hidden = true;
         self.configured = false;
         self.frame_pending = false;
-        self.ui.view.press = None;
+        // The new toplevel needs its size hints sent again.
+        self.logical = (0, 0);
+        self.ui.pointer_lost();
+        self.ui.clear_vis();
     }
 
     /// Maps the window again: the fresh toplevel's first commit starts the
@@ -353,30 +426,29 @@ impl App {
 
     fn draw(&mut self) {
         let qh = self.qh.clone();
-        {
-            let mut live = self.engine.live.lock().unwrap();
+        let live = self.engine.live.clone();
+        let replies = {
+            let mut live = live.lock().unwrap();
             let replies = std::mem::take(&mut live.replies);
-            for (tag, v) in replies {
-                let a = self.ui.reply(&tag, &v);
-                drop(live);
-                self.apply(a);
-                live = self.engine.live.lock().unwrap();
+            // The latest failure is the one worth reading.
+            if let Some(e) = live.errors.pop() {
+                live.errors.clear();
+                self.ui.note(e);
             }
             self.ui.draw(&live);
-        }
+            if live.snap.playing() || live.snap.paused() {
+                self.last_clock = Some(live.position() as u64);
+            }
+            replies
+        };
         let z = self.zoom();
         let (sw, sh) = (self.ui.canvas.w, self.ui.canvas.h);
-        // Logical size rounds up; the buffer covers it exactly, with any
-        // spare physical pixels left transparent on the right and bottom.
-        let lw = ((sw * z) as f64 / self.scale).ceil() as i32;
-        let lh = ((sh * z) as f64 / self.scale).ceil() as i32;
-        let (bw, bh) = if self.viewport.is_some() {
-            (
-                (lw as f64 * self.scale).round() as i32,
-                (lh as f64 * self.scale).round() as i32,
-            )
+        let (lw, lh, bw, bh) = if self.viewport.is_some() {
+            let (lw, bw) = self.fit(sw * z);
+            let (lh, bh) = self.fit(sh * z);
+            (lw, lh, bw, bh)
         } else {
-            (sw * z, sh * z)
+            (sw * z, sh * z, sw * z, sh * z)
         };
         let stride = bw * 4;
         let Ok((buffer, canvas)) =
@@ -401,10 +473,8 @@ impl App {
         let surface = self.window.wl_surface();
         if let Some(vp) = &self.viewport {
             vp.set_destination(lw, lh);
-            surface.set_buffer_scale(1);
-        } else {
-            surface.set_buffer_scale(1);
         }
+        surface.set_buffer_scale(1);
         if (lw, lh) != self.logical {
             self.logical = (lw, lh);
             let size = Some((lw as u32, lh as u32));
@@ -425,6 +495,9 @@ impl App {
             if let Some((x, y)) = self.state.pos {
                 crate::hypr::restore(x, y);
             }
+            if self.ui.view.pinned {
+                crate::hypr::pin(true);
+            }
         }
         if !self.shown {
             self.shown = true;
@@ -433,10 +506,50 @@ impl App {
                 self.started.elapsed().as_millis()
             );
         }
+        // Answers to queries (a playlist list to choose from) act after the
+        // frame, so their redraw is not nested inside this one.
+        for (tag, v) in replies {
+            let a = self.ui.reply(&tag, &v);
+            self.apply(a);
+        }
     }
 
     fn engine_changed(&mut self) {
         self.redraw();
+    }
+
+    fn message(&mut self, m: Msg) {
+        match m {
+            Msg::Actions(a) => self.apply(a),
+            Msg::Note(text) => {
+                self.ui.note(text);
+                self.redraw();
+            }
+            Msg::NoChooser => {
+                self.ui.open_prompt(crate::ui::PromptKind::AddLocation);
+                self.apply(vec![Action::Resize]);
+            }
+            Msg::Skin(generation, skin) => {
+                if generation == self.skin_gen {
+                    self.ui.set_skin(*skin);
+                    self.redraw();
+                }
+            }
+        }
+    }
+
+    /// Loads the worn skin on a worker: unzipping, decoding and building
+    /// region masks can take a moment, and the window keeps running.
+    fn load_skin_async(&mut self) {
+        self.skin_gen += 1;
+        let generation = self.skin_gen;
+        let state = self.state.clone();
+        let base = self.base.clone();
+        let tx = self.msgs.clone();
+        std::thread::spawn(move || {
+            let skin = load_skin(&state, &base);
+            let _ = tx.send(Msg::Skin(generation, Box::new(skin)));
+        });
     }
 
     fn tick(&mut self) {
@@ -446,30 +559,47 @@ impl App {
         if seen != self.state_seen {
             self.state_seen = seen;
             let fresh = State::load();
-            if fresh.skin != self.state.skin {
-                let skin = load_skin(&fresh, &self.base);
-                self.ui.set_skin(skin);
-            }
+            let changed = fresh.skin != self.state.skin || fresh.skin_md5 != self.state.skin_md5;
             self.state.skin = fresh.skin;
             self.state.skin_name = fresh.skin_name;
             self.state.skin_md5 = fresh.skin_md5;
+            if changed {
+                self.load_skin_async();
+            }
+        }
+        if let Some((_, at)) = &self.ui.view.note
+            && at.elapsed() > crate::ui::NOTE_FOR
+        {
+            self.ui.view.note = None;
             self.dirty = true;
         }
-        let live = self.engine.live.lock().unwrap();
+        let live = self.engine.live.clone();
+        let live = live.lock().unwrap();
         let animating = self.ui.animating(&live) || self.ui.view.press.is_some();
-        let want_vis = self.ui.view.vis_on;
+        // The clock only needs a frame when its second changes.
+        let clock = (live.snap.playing() || live.snap.paused()).then(|| live.position() as u64);
         drop(live);
+        if clock != self.last_clock {
+            self.dirty = true;
+        }
         self.engine.want_spectrum.store(
-            want_vis && !self.hidden,
+            self.ui.view.vis_on && !self.hidden,
             std::sync::atomic::Ordering::Relaxed,
         );
-        if animating || self.dirty {
+        if !self.hidden && (animating || self.dirty) {
             self.redraw();
         }
     }
 
     fn apply(&mut self, actions: Vec<Action>) {
+        if actions.is_empty() {
+            if self.dirty {
+                self.redraw();
+            }
+            return;
+        }
         let mut layout_changed = false;
+        let mut save = false;
         for a in actions {
             match a {
                 Action::Op(name, params) => self.engine.op(&name, params),
@@ -482,35 +612,279 @@ impl App {
                 Action::Close => self.exit = true,
                 Action::Minimize => self.hide(),
                 Action::Resize | Action::Zoom => layout_changed = true,
+                Action::Save => save = true,
+                Action::OpenMenu(x, y) => self.open_menu(x, y),
+                Action::PickFiles(kind) => self.pick_files(kind),
+                Action::Pin(on) => crate::hypr::pin(on),
+                Action::SkinBrowser => open_skin_browser(),
+                Action::BaseSkin => {
+                    let mut st = State::load();
+                    st.skin = None;
+                    st.skin_name = None;
+                    st.skin_md5 = None;
+                    if let Err(e) = st.save() {
+                        self.ui.note(format!("Could not change skin: {e}"));
+                    }
+                    // The tick notices state.json and loads the base.
+                }
             }
         }
-        if layout_changed {
-            self.save_state();
+        if layout_changed || save {
+            self.save_state(false);
         }
         self.redraw();
     }
 
-    fn save_state(&mut self) {
+    /// Writes the view to state.json. The window position is asked of
+    /// Hyprland only when `with_pos` (on minimize and quit): it means a
+    /// process spawn, too slow for every playlist resize step.
+    fn save_state(&mut self, with_pos: bool) {
         let v = &self.ui.view;
-        // Keep the user's base zoom: double size is a view of it.
-        self.state.zoom = v.zoom;
+        // The base zoom: double size is a view of it.
+        self.state.zoom = if v.double {
+            (v.zoom / 2).max(1)
+        } else {
+            v.zoom
+        };
         self.state.shaded = v.shaded;
         self.state.eq_open = v.eq_open;
         self.state.pl_open = v.pl_open;
         self.state.pl_h = v.pl_h;
         self.state.time_remaining = v.time_remaining;
         self.state.vis_on = v.vis_on;
-        if !self.hidden
+        self.state.double = v.double;
+        self.state.pinned = v.pinned;
+        self.state.eq_saved = v.eq_saved.clone();
+        if with_pos
+            && !self.hidden
             && let Some(pos) = crate::hypr::position()
         {
             self.state.pos = Some(pos);
         }
-        // Merge with the file so a skin picked meanwhile is not lost.
+        // The skin belongs to whoever wrote state.json last (the bar, a
+        // drop): keep theirs, and load it if this window has not yet.
         let disk = State::load();
-        self.state.skin = disk.skin.or(self.state.skin.take());
+        let skin_changed = disk.skin != self.state.skin || disk.skin_md5 != self.state.skin_md5;
+        self.state.skin = disk.skin;
+        self.state.skin_name = disk.skin_name;
+        self.state.skin_md5 = disk.skin_md5;
+        if skin_changed {
+            self.load_skin_async();
+        }
         if self.state.save().is_ok() {
             self.state_seen = mtime(&store::state_path());
         }
+    }
+
+    // ---- the main menu ---------------------------------------------------------
+
+    fn open_menu(&mut self, x: i32, y: i32) {
+        self.close_menu();
+        let Some(seat) = self.seat.clone() else {
+            return;
+        };
+        let (mw, mh) = self.ui.menu_size();
+        let z = self.zoom();
+        let (lw, _) = self.fit(mw * z);
+        let (lh, _) = self.fit(mh * z);
+        let s = self.scale120() as f64 / 120.0;
+        let ax = (x * z) as f64 / s;
+        let ay = (y * z) as f64 / s;
+        let Ok(positioner) = XdgPositioner::new(&self.xdg) else {
+            return;
+        };
+        positioner.set_size(lw, lh);
+        positioner.set_anchor_rect(ax as i32, ay as i32, 1, 1);
+        positioner.set_anchor(xdg_positioner::Anchor::TopLeft);
+        positioner.set_gravity(xdg_positioner::Gravity::BottomRight);
+        positioner.set_constraint_adjustment(
+            xdg_positioner::ConstraintAdjustment::SlideX
+                | xdg_positioner::ConstraintAdjustment::SlideY
+                | xdg_positioner::ConstraintAdjustment::FlipX
+                | xdg_positioner::ConstraintAdjustment::FlipY,
+        );
+        let Ok(popup) = Popup::new(
+            self.window.xdg_surface(),
+            &positioner,
+            &self.qh,
+            &self.compositor,
+            &self.xdg,
+        ) else {
+            return;
+        };
+        let viewport = self
+            .viewporter
+            .as_ref()
+            .map(|vp| vp.get_viewport(popup.wl_surface(), &self.qh, ()));
+        popup.xdg_popup().grab(&seat, self.press_serial);
+        popup.wl_surface().commit();
+        self.menu = Some(MenuPopup {
+            popup,
+            viewport,
+            hover: None,
+            configured: false,
+        });
+    }
+
+    fn close_menu(&mut self) {
+        if let Some(m) = self.menu.take() {
+            if let Some(v) = m.viewport {
+                v.destroy();
+            }
+            drop(m.popup);
+        }
+    }
+
+    fn draw_menu(&mut self) {
+        let Some(hover) = self.menu.as_ref().filter(|m| m.configured).map(|m| m.hover) else {
+            return;
+        };
+        let (mw, mh) = self.ui.menu_size();
+        let z = self.zoom();
+        let (lw, bw) = self.fit(mw * z);
+        let (lh, bh) = self.fit(mh * z);
+        let Ok((buffer, canvas)) =
+            self.pool
+                .create_buffer(bw, bh, bw * 4, wl_shm::Format::Argb8888)
+        else {
+            return;
+        };
+        canvas.fill(0);
+        let content = (mw * z * 4) as usize;
+        let mut tight = vec![0u8; content * (mh * z) as usize];
+        self.ui.draw_menu(hover, &mut tight, z);
+        for (row, chunk) in tight.chunks_exact(content).enumerate() {
+            let o = row * (bw * 4) as usize;
+            canvas[o..o + content].copy_from_slice(chunk);
+        }
+        let Some(m) = &self.menu else { return };
+        let surface = m.popup.wl_surface();
+        if let Some(vp) = &m.viewport {
+            vp.set_destination(lw, lh);
+        }
+        surface.damage_buffer(0, 0, bw, bh);
+        if buffer.attach_to(surface).is_ok() {
+            surface.commit();
+        }
+    }
+
+    /// Pointer events over the menu.
+    fn menu_pointer(&mut self, event: &PointerEvent) {
+        let (x, y) = self.skin_pos(event.position);
+        let item = self.ui.menu_item_at(x, y);
+        match event.kind {
+            PointerEventKind::Motion { .. } | PointerEventKind::Enter { .. } => {
+                if let Some(m) = self.menu.as_mut()
+                    && m.hover != item
+                {
+                    m.hover = item;
+                    self.draw_menu();
+                }
+            }
+            PointerEventKind::Leave { .. } => {
+                if let Some(m) = self.menu.as_mut() {
+                    m.hover = None;
+                }
+                self.draw_menu();
+            }
+            PointerEventKind::Release { .. } => {
+                let Some(i) = item else { return };
+                let cmd = self.ui.menu_items()[i].cmd;
+                self.close_menu();
+                let live = self.engine.live.clone();
+                let live = live.lock().unwrap();
+                let actions = self.ui.menu_command(&live, cmd);
+                drop(live);
+                self.apply(actions);
+            }
+            _ => {}
+        }
+    }
+
+    // ---- files --------------------------------------------------------------------
+
+    /// Runs the file chooser on a thread and queues what comes back. Without
+    /// a chooser, falls back to typing a path into the playlist.
+    fn pick_files(&mut self, kind: Pick) {
+        let tx = self.msgs.clone();
+        std::thread::spawn(move || {
+            let (title, folder) = match kind {
+                Pick::Play => ("Play files", false),
+                Pick::AddFiles => ("Add files to the playlist", false),
+                Pick::AddFolder => ("Add a folder to the playlist", true),
+            };
+            let picked = match crate::picker::pick(title, folder) {
+                Ok(Some(p)) => p,
+                Ok(None) => return,
+                Err(e) => {
+                    log::warn!("{e:#}");
+                    let _ = tx.send(Msg::NoChooser);
+                    return;
+                }
+            };
+            let files: Vec<std::path::PathBuf> = picked
+                .into_iter()
+                .flat_map(|p| {
+                    if p.is_dir() {
+                        crate::picker::audio_in(&p)
+                    } else {
+                        vec![p]
+                    }
+                })
+                .collect();
+            if files.is_empty() {
+                let _ = tx.send(Msg::Note("No audio files there".into()));
+                return;
+            }
+            let _ = tx.send(Msg::Actions(queue_files(kind, &files)));
+        });
+    }
+}
+
+/// The operations that put picked files in the playlist.
+fn queue_files(kind: Pick, files: &[std::path::PathBuf]) -> Vec<Action> {
+    let mut out = vec![];
+    if kind == Pick::Play {
+        out.push(crate::ui::op("queue.clear", serde_json::json!({})));
+    }
+    for f in files {
+        out.push(crate::ui::op(
+            "queue",
+            serde_json::json!({"path": f.to_string_lossy()}),
+        ));
+    }
+    if kind == Pick::Play {
+        out.push(crate::ui::op("queue.play", serde_json::json!({"index": 0})));
+    }
+    out
+}
+
+/// Opens the bar panel on its Skins tab (omarchy-shell's IPC).
+fn open_skin_browser() {
+    let shell = std::env::var("OMARCHY_PATH")
+        .map(|p| format!("{p}/shell"))
+        .unwrap_or_else(|_| "/usr/share/omarchy/shell".into());
+    let _ = std::process::Command::new("qs")
+        .args([
+            "ipc",
+            "-n",
+            "-p",
+            &shell,
+            "call",
+            "derekross.llama",
+            "skins",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|mut c| std::thread::spawn(move || c.wait()));
+}
+
+fn gcd(a: i32, b: i32) -> i32 {
+    if b == 0 {
+        a.abs().max(1)
+    } else {
+        gcd(b, a % b)
     }
 }
 
@@ -622,7 +996,7 @@ impl SeatHandler for App {
                 &seat,
                 None,
                 self.handle.clone(),
-                Box::new(|app: &mut App, _, event| app.key(event)),
+                Box::new(|app: &mut App, _, event| app.key(event, true)),
             );
             self.keyboard = kb.ok();
         }
@@ -658,7 +1032,7 @@ impl SeatHandler for App {
 }
 
 impl App {
-    fn key(&mut self, event: KeyEvent) {
+    fn key(&mut self, event: KeyEvent, repeat: bool) {
         let key = match event.keysym {
             Keysym::Up => Key::Up,
             Keysym::Down => Key::Down,
@@ -668,10 +1042,31 @@ impl App {
             Keysym::Escape => Key::Escape,
             Keysym::BackSpace => Key::Backspace,
             Keysym::Delete => Key::Delete,
+            Keysym::Page_Up => Key::PageUp,
+            Keysym::Page_Down => Key::PageDown,
+            Keysym::Home => Key::Home,
+            Keysym::End => Key::End,
             _ => Key::Other,
         };
-        let live = self.engine.live.lock().unwrap().clone();
-        let actions = self.ui.key(&live, key, event.utf8.as_deref(), self.ctrl);
+        if repeat && !self.repeat_ok {
+            return;
+        }
+        if !repeat {
+            self.repeat_ok = self.ui.repeats(key, self.ui.view.prompt.is_some());
+        }
+        if key == Key::Escape && self.menu.is_some() {
+            self.close_menu();
+            return;
+        }
+        // The key's own character, before Ctrl turns it into a control code.
+        let ch = event.keysym.key_char();
+        let live = self.engine.live.clone();
+        let live = live.lock().unwrap();
+        let actions = self
+            .ui
+            .key(&live, key, ch, event.utf8.as_deref(), self.mods);
+        drop(live);
+        self.dirty = true;
         self.apply(actions);
     }
 }
@@ -707,7 +1102,7 @@ impl KeyboardHandler for App {
         _: u32,
         event: KeyEvent,
     ) {
-        self.key(event);
+        self.key(event, false);
     }
 
     fn repeat_key(
@@ -718,7 +1113,7 @@ impl KeyboardHandler for App {
         _: u32,
         event: KeyEvent,
     ) {
-        self.key(event);
+        self.key(event, true);
     }
 
     fn release_key(
@@ -741,7 +1136,11 @@ impl KeyboardHandler for App {
         _: RawModifiers,
         _: u32,
     ) {
-        self.ctrl = modifiers.ctrl;
+        self.mods = Mods {
+            ctrl: modifiers.ctrl,
+            alt: modifiers.alt,
+            shift: modifiers.shift,
+        };
     }
 }
 
@@ -754,57 +1153,21 @@ impl PointerHandler for App {
         events: &[PointerEvent],
     ) {
         for event in events {
+            if let Some(m) = &self.menu
+                && &event.surface == m.popup.wl_surface()
+            {
+                self.menu_pointer(event);
+                continue;
+            }
             if &event.surface != self.window.wl_surface() {
                 continue;
             }
             self.ptr = event.position;
             let (x, y) = self.skin_pos(event.position);
-            let live = self.engine.live.lock().unwrap().clone();
-            let actions = match event.kind {
-                PointerEventKind::Enter { .. } => {
-                    self.set_cursor = true;
-                    vec![]
-                }
-                PointerEventKind::Leave { .. } => vec![],
-                PointerEventKind::Motion { .. } => {
-                    let a = self.ui.pointer_move(&live, x, y);
-                    if self.ui.view.pl_menu.is_some() {
-                        self.dirty = true;
-                    }
-                    a
-                }
-                PointerEventKind::Press {
-                    button: BTN_LEFT,
-                    serial,
-                    ..
-                } => {
-                    self.press_serial = serial;
-                    self.ui.pointer_down(&live, x, y)
-                }
-                PointerEventKind::Release {
-                    button: BTN_LEFT, ..
-                } => self.ui.pointer_up(&live, x, y),
-                PointerEventKind::Axis { vertical, .. } => {
-                    let dy = if vertical.discrete != 0 {
-                        vertical.discrete as f64
-                    } else {
-                        vertical.absolute
-                    };
-                    if dy.abs() > 0.0 {
-                        self.ui.scroll(&live, x, y, dy)
-                    } else {
-                        vec![]
-                    }
-                }
-                _ => vec![],
-            };
-            let pressed = matches!(
-                event.kind,
-                PointerEventKind::Press { .. } | PointerEventKind::Release { .. }
-            );
-            if pressed || !actions.is_empty() || self.ui.view.press.is_some() {
-                self.dirty = true;
-            }
+            let live = self.engine.live.clone();
+            let live = live.lock().unwrap();
+            let actions = self.pointer_event(&live, event, x, y);
+            drop(live);
             self.apply(actions);
         }
         if self.set_cursor {
@@ -812,6 +1175,111 @@ impl PointerHandler for App {
                 let _ = p.set_cursor(conn, CursorIcon::Default);
             }
             self.set_cursor = false;
+        }
+    }
+}
+
+impl App {
+    fn pointer_event(&mut self, live: &Live, event: &PointerEvent, x: i32, y: i32) -> Vec<Action> {
+        match event.kind {
+            PointerEventKind::Enter { .. } => {
+                self.set_cursor = true;
+                vec![]
+            }
+            PointerEventKind::Leave { .. } => {
+                // A compositor bind can take the pointer mid-drag, with no
+                // release to follow.
+                if self.ui.view.press.is_some() {
+                    self.ui.pointer_lost();
+                    self.dirty = true;
+                }
+                vec![]
+            }
+            PointerEventKind::Motion { .. } => {
+                let a = self.ui.pointer_move(live, x, y);
+                if self.ui.view.pl_menu.is_some() || self.ui.view.press.is_some() {
+                    self.dirty = true;
+                }
+                a
+            }
+            PointerEventKind::Press {
+                button: BTN_LEFT,
+                serial,
+                ..
+            } => {
+                self.press_serial = serial;
+                self.dirty = true;
+                self.ui.pointer_down(live, x, y, self.mods)
+            }
+            PointerEventKind::Press {
+                button: BTN_RIGHT,
+                serial,
+                ..
+            } => {
+                self.press_serial = serial;
+                self.dirty = true;
+                self.ui.pointer_menu(x, y)
+            }
+            PointerEventKind::Release {
+                button: BTN_LEFT, ..
+            } => {
+                self.dirty = true;
+                self.ui.pointer_up(live, x, y)
+            }
+            PointerEventKind::Axis { vertical, .. } => {
+                // A wheel notch is 120; a touchpad sends pixels, about 15 a
+                // step. Either way, only whole steps scroll.
+                let steps = if vertical.value120 != 0 {
+                    self.scroll_acc.0 += vertical.value120;
+                    let n = self.scroll_acc.0 / 120;
+                    self.scroll_acc.0 -= n * 120;
+                    n
+                } else if vertical.discrete != 0 {
+                    vertical.discrete
+                } else {
+                    self.scroll_acc.1 += vertical.absolute;
+                    let n = (self.scroll_acc.1 / 15.0).trunc();
+                    self.scroll_acc.1 -= n * 15.0;
+                    n as i32
+                };
+                if vertical.stop {
+                    self.scroll_acc = (0, 0.0);
+                }
+                if steps != 0 {
+                    self.dirty = true;
+                    self.ui.scroll(live, x, y, steps)
+                } else {
+                    vec![]
+                }
+            }
+            _ => vec![],
+        }
+    }
+}
+
+impl PopupHandler for App {
+    fn configure(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        popup: &Popup,
+        _: PopupConfigure,
+    ) {
+        if let Some(m) = self.menu.as_mut()
+            && m.popup.wl_surface() == popup.wl_surface()
+        {
+            m.configured = true;
+            self.draw_menu();
+        }
+    }
+
+    fn done(&mut self, _: &Connection, _: &QueueHandle<Self>, popup: &Popup) {
+        if self
+            .menu
+            .as_ref()
+            .is_some_and(|m| m.popup.wl_surface() == popup.wl_surface())
+        {
+            self.close_menu();
         }
     }
 }
@@ -892,6 +1360,7 @@ delegate_keyboard!(App);
 delegate_pointer!(App);
 delegate_xdg_shell!(App);
 delegate_xdg_window!(App);
+delegate_xdg_popup!(App);
 delegate_registry!(App);
 delegate_data_device!(App);
 
@@ -912,15 +1381,18 @@ pub fn uri_files(list: &str) -> Vec<std::path::PathBuf> {
             } else {
                 p.find('/').map_or(p, |i| &p[i..])
             };
+            // Decode on bytes: a stray '%' next to a multi-byte character
+            // must not split it.
             let bytes = p.as_bytes();
+            let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
             let mut out = Vec::with_capacity(bytes.len());
             let mut i = 0;
             while i < bytes.len() {
                 if bytes[i] == b'%'
                     && i + 2 < bytes.len()
-                    && let Ok(b) = u8::from_str_radix(&p[i + 1..i + 3], 16)
+                    && let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
                 {
-                    out.push(b);
+                    out.push(h << 4 | l);
                     i += 3;
                     continue;
                 }
@@ -966,6 +1438,11 @@ impl DataDeviceHandler for App {
         let Some(offer) = device.data().drag_offer() else {
             return;
         };
+        // Only a drop we accepted (one offering file paths) is ours to read.
+        if !offer.with_mime_types(|m| m.iter().any(|t| t == URI_LIST)) {
+            offer.destroy();
+            return;
+        }
         let pipe = match offer.receive(URI_LIST.to_string()) {
             Ok(p) => p,
             Err(e) => {
@@ -976,6 +1453,7 @@ impl DataDeviceHandler for App {
         let _ = conn.flush();
         offer.finish();
         offer.destroy();
+        let tx = self.msgs.clone();
         // Read and install off the event loop: the sender writes at its own
         // pace, and a Museum-free local install still touches the disk. The
         // window picks the new skin up from the state file.
@@ -992,11 +1470,14 @@ impl DataDeviceHandler for App {
                     .map(|e| e.to_string_lossy().to_ascii_lowercase());
                 matches!(ext.as_deref(), Some("wsz" | "zip"))
             });
-            if let Some(p) = skin
-                && let Err(e) = crate::skins::wear(&p.to_string_lossy())
-            {
-                log::warn!("dropped skin: {e:#}");
-            }
+            let note = match skin {
+                Some(p) => match crate::skins::wear(&p.to_string_lossy()) {
+                    Ok(_) => return,
+                    Err(e) => format!("Could not wear that skin: {e:#}"),
+                },
+                None => "Drop a .wsz skin here to wear it".into(),
+            };
+            let _ = tx.send(Msg::Note(note));
         });
     }
 }
@@ -1060,5 +1541,30 @@ mod tests {
                 std::path::PathBuf::from("/x/b.zip")
             ]
         );
+    }
+
+    #[test]
+    fn stray_percent_does_not_split_characters() {
+        let files = super::uri_files("file:///x/%a\u{e9}.wsz\nfile:///y/%+f.wsz\n");
+        assert_eq!(
+            files,
+            vec![
+                std::path::PathBuf::from("/x/%a\u{e9}.wsz"),
+                std::path::PathBuf::from("/y/%+f.wsz")
+            ]
+        );
+    }
+
+    #[test]
+    fn sizes_are_whole_pixels_at_every_scale() {
+        for n in [120, 150, 180, 210, 240] {
+            let step = 120 / super::gcd(n, 120);
+            for px in [550, 551, 1100, 908] {
+                let logical = (px * 120 + n - 1) / n;
+                let logical = (logical + step - 1) / step * step;
+                assert_eq!(logical * n % 120, 0, "scale {n}, {px}px");
+                assert!(logical * n / 120 >= px);
+            }
+        }
     }
 }

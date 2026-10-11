@@ -61,12 +61,34 @@ pub fn parse(text: &str) -> Regions {
     regions
 }
 
+/// Real skins use a few hundred points; anything far beyond that is broken
+/// or hostile, and the section is dropped rather than rasterised.
+const MAX_POLY_POINTS: usize = 1_000;
+const MAX_POINTS: usize = 10_000;
+
 fn polygons(counts: &str, points: &str) -> Vec<Vec<(f32, f32)>> {
+    let mut sizes = Vec::new();
+    let mut total = 0usize;
+    for n in counts
+        .split(',')
+        .filter_map(|s| s.trim().parse::<usize>().ok())
+    {
+        total = match total.checked_add(n) {
+            Some(t) if n <= MAX_POLY_POINTS && t <= MAX_POINTS => t,
+            _ => return Vec::new(),
+        };
+        sizes.push(n);
+    }
     let nums: Vec<f32> = points
         .split([',', ' ', '\t'])
         .filter(|s| !s.is_empty())
         .filter_map(|s| s.trim().parse().ok())
+        .take(2 * total)
         .collect();
+    // "inf" and "NaN" parse as floats; no real skin has them.
+    if nums.iter().any(|v: &f32| !v.is_finite()) {
+        return Vec::new();
+    }
     let pts: Vec<(f32, f32)> = nums
         .as_chunks::<2>()
         .0
@@ -75,10 +97,8 @@ fn polygons(counts: &str, points: &str) -> Vec<Vec<(f32, f32)>> {
         .collect();
     let mut out = Vec::new();
     let mut i = 0;
-    for n in counts
-        .split(',')
-        .filter_map(|s| s.trim().parse::<usize>().ok())
-    {
+    for n in sizes {
+        // Cannot overflow: the sizes sum to at most MAX_POINTS.
         if i + n > pts.len() {
             break; // more polygons declared than points given
         }
@@ -90,23 +110,16 @@ fn polygons(counts: &str, points: &str) -> Vec<Vec<(f32, f32)>> {
     out
 }
 
-fn inside(x: f32, y: f32, poly: &[(f32, f32)]) -> bool {
-    let mut c = false;
-    let mut j = poly.len() - 1;
-    for i in 0..poly.len() {
-        let (xi, yi) = poly[i];
-        let (xj, yj) = poly[j];
-        if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
-            c = !c;
-        }
-        j = i;
-    }
-    c
-}
-
 /// A w×h mask, `true` where the window is opaque.
+///
+/// Scanline even-odd fill: for each row, the x where every edge crosses the
+/// pixel-centre line, sorted; a pixel centre is inside when an odd number of
+/// crossings lie to its right. That is the classic point-in-polygon test
+/// evaluated once per row instead of once per pixel, with the same float
+/// expression, so the result is bit-for-bit the same.
 pub fn mask(polys: &[Vec<(f32, f32)>], w: i32, h: i32) -> Vec<bool> {
-    let mut m = vec![false; (w * h) as usize];
+    let mut m = vec![false; (w.max(0) * h.max(0)) as usize];
+    let mut xs_cross = Vec::new();
     for poly in polys {
         let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
         for &(x, y) in poly {
@@ -118,8 +131,30 @@ pub fn mask(polys: &[Vec<(f32, f32)>], w: i32, h: i32) -> Vec<bool> {
         let xs = (x0.floor().max(0.0) as i32)..(x1.ceil().min(w as f32) as i32);
         let ys = (y0.floor().max(0.0) as i32)..(y1.ceil().min(h as f32) as i32);
         for y in ys {
+            let yc = y as f32 + 0.5;
+            xs_cross.clear();
+            let mut j = poly.len() - 1;
+            for i in 0..poly.len() {
+                let (xi, yi) = poly[i];
+                let (xj, yj) = poly[j];
+                if (yi > yc) != (yj > yc) {
+                    let c = (xj - xi) * (yc - yi) / (yj - yi) + xi;
+                    // `x < NaN` never toggles.
+                    if !c.is_nan() {
+                        xs_cross.push(c);
+                    }
+                }
+                j = i;
+            }
+            xs_cross.sort_unstable_by(f32::total_cmp);
+            // Crossings at or left of the current pixel centre.
+            let mut k = 0;
             for x in xs.clone() {
-                if inside(x as f32 + 0.5, y as f32 + 0.5, poly) {
+                let xc = x as f32 + 0.5;
+                while k < xs_cross.len() && xs_cross[k] <= xc {
+                    k += 1;
+                }
+                if (xs_cross.len() - k) % 2 == 1 {
                     m[(y * w + x) as usize] = true;
                 }
             }
@@ -152,12 +187,145 @@ mod tests {
 
     #[test]
     fn real_skin_sections() {
-        let text = include_str!("../../tests/region-green-dimension.txt");
-        let r = parse(text);
+        let Some(skin) = crate::skin::test_skin("Green-Dimension-V2") else {
+            return;
+        };
+        let r = skin.region;
         assert!(r.normal.is_some() && r.shade.is_some() && r.eq.is_some() && r.eq_shade.is_some());
         let m = mask(r.normal.as_ref().unwrap(), 275, 116);
         // The corner at (0,0) is cut away; the middle of the window is not.
         assert!(!m[0]);
         assert!(m[(50 * 275 + 150) as usize]);
+    }
+
+    #[test]
+    fn overflowing_numpoints_is_dropped() {
+        let r = parse("[Normal]\nNumPoints=3,18446744073709551615\nPointList=0,0 4,0 4,4\n");
+        assert!(r.normal.is_none());
+        let r = parse("[Normal]\nNumPoints=18446744073709551615,3\nPointList=0,0 4,0 4,4\n");
+        assert!(r.normal.is_none());
+    }
+
+    #[test]
+    fn huge_point_counts_are_dropped_quickly() {
+        let n = 100_000;
+        let pts: Vec<String> = (0..n)
+            .map(|i| {
+                let a = i as f32 / n as f32 * std::f32::consts::TAU;
+                format!("{},{}", 137.0 + 130.0 * a.cos(), 58.0 + 55.0 * a.sin())
+            })
+            .collect();
+        let text = format!("[Normal]\nNumPoints={n}\nPointList={}\n", pts.join(" "));
+        let t = std::time::Instant::now();
+        let r = parse(&text);
+        assert!(r.normal.is_none());
+        // Many polygons each under the cap still hit the total cap.
+        let counts = ["900"; 20].join(",");
+        let text = format!(
+            "[Normal]\nNumPoints={counts}\nPointList={}\n",
+            pts.join(" ")
+        );
+        assert!(parse(&text).normal.is_none());
+        // The largest accepted region still rasterises fast.
+        let counts = ["1000"; 10].join(",");
+        let text = format!(
+            "[Normal]\nNumPoints={counts}\nPointList={}\n",
+            pts.join(" ")
+        );
+        let r = parse(&text);
+        assert_eq!(r.normal.as_ref().unwrap().len(), 10);
+        mask(r.normal.as_ref().unwrap(), 275, 116);
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+
+    #[test]
+    fn non_finite_points_are_dropped() {
+        assert!(
+            parse("[Normal]\nNumPoints=3\nPointList=0,0 inf,0 4,NaN\n")
+                .normal
+                .is_none()
+        );
+    }
+
+    /// The per-pixel point-in-polygon test the scanline fill replaced.
+    fn inside(x: f32, y: f32, poly: &[(f32, f32)]) -> bool {
+        let mut c = false;
+        let mut j = poly.len() - 1;
+        for i in 0..poly.len() {
+            let (xi, yi) = poly[i];
+            let (xj, yj) = poly[j];
+            if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+                c = !c;
+            }
+            j = i;
+        }
+        c
+    }
+
+    fn reference_mask(polys: &[Vec<(f32, f32)>], w: i32, h: i32) -> Vec<bool> {
+        let mut m = vec![false; (w * h) as usize];
+        for poly in polys {
+            for y in 0..h {
+                for x in 0..w {
+                    if inside(x as f32 + 0.5, y as f32 + 0.5, poly) {
+                        m[(y * w + x) as usize] = true;
+                    }
+                }
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn scanline_matches_point_in_polygon() {
+        // xorshift, so the polygons are the same every run.
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = move |range: f32| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / (1u64 << 24) as f32 * range
+        };
+        for round in 0..200 {
+            let (w, h) = (40, 30);
+            let polys: Vec<Vec<(f32, f32)>> = (0..1 + round % 4)
+                .map(|_| {
+                    let n = 3 + (rnd(10.0) as usize);
+                    (0..n)
+                        .map(|_| {
+                            let (x, y) = (rnd(50.0) - 5.0, rnd(40.0) - 5.0);
+                            // Half the rounds on whole and half pixels, where
+                            // edges pass exactly through pixel centres.
+                            if round % 2 == 0 {
+                                ((x * 2.0).round() / 2.0, (y * 2.0).round() / 2.0)
+                            } else {
+                                (x, y)
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            assert_eq!(
+                mask(&polys, w, h),
+                reference_mask(&polys, w, h),
+                "{polys:?}"
+            );
+        }
+        if let Some(skin) = crate::skin::test_skin("Green-Dimension-V2") {
+            let r = skin.region;
+            for (polys, h) in [
+                (r.normal, 116),
+                (r.shade, 14),
+                (r.eq, 116),
+                (r.eq_shade, 14),
+            ] {
+                let polys = polys.unwrap();
+                assert_eq!(mask(&polys, 275, h), reference_mask(&polys, 275, h));
+            }
+        }
     }
 }

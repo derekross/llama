@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "hyprctl $*" >> "${FAKE_LOG:-/dev/null}"
+exit 0

@@ -335,6 +335,9 @@ impl Ui {
                 let db = 12.0 - drag * 24.0;
                 format!("EQ: {}: {:+.1} dB", HZ[b], db)
             }
+            _ if self.view.note.is_some() => {
+                self.view.note.as_ref().map(|n| n.0.clone()).unwrap_or_default()
+            }
             _ if !live.connected => "Llama: waiting for cliamp...".into(),
             _ if live.busy() => {
                 "cliamp is busy loading from a provider; your clicks will go through when it is done  ***  ".into()
@@ -348,7 +351,7 @@ impl Ui {
                     if s.duration > 0.0 {
                         text.push_str(&format!(" ({})", clock(s.duration)));
                     }
-                    if let Some(e) = live.error.as_ref().or(s.stream_error.as_ref()) {
+                    if let Some(e) = s.stream_error.as_ref() {
                         text.push_str(&format!("  ***  {e}"));
                     }
                     if text.chars().count() as i32 * sp::CHAR_W > sp::MARQUEE.w {
@@ -356,7 +359,7 @@ impl Ui {
                     }
                     text
                 }
-                None => "Llama 0.1 - it really whips the llama's ass".into(),
+                None => concat!("Llama ", env!("CARGO_PKG_VERSION"), " - it really whips the llama's ass").into(),
             },
         };
         if text != self.marquee_text {
@@ -541,6 +544,16 @@ impl Ui {
                 }
                 let db = ((12.0 - r * 24.0) * 2.0).round() / 2.0;
                 let old = before.map(|r| ((12.0 - r * 24.0) * 2.0).round() / 2.0);
+                // With EQ off, a drag shapes the curve ON will bring back,
+                // silently, like Winamp's bypass.
+                if let Some(saved) = self.view.eq_saved.as_mut() {
+                    saved.resize(10, 0.0);
+                    if saved[b] != db {
+                        saved[b] = db;
+                        return vec![Action::Save];
+                    }
+                    return vec![];
+                }
                 let current = live.snap.eq_bands.get(b).copied();
                 if old != Some(db) && current != Some(db) {
                     return vec![op("eq", json!({"band": b, "value": db}))];
@@ -555,12 +568,11 @@ impl Ui {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skin::Skin;
     use crate::ui::View;
 
     fn ui() -> Ui {
-        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/skins/base-2.91.wsz");
-        Ui::new(Skin::load(&p).unwrap(), View::default())
+        let skin = crate::skin::test_skin("base-2.91").unwrap_or_default();
+        Ui::new(skin, View::default())
     }
 
     #[test]

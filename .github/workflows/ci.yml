@@ -1,0 +1,61 @@
+# Format, lint and test on every push and pull request; then the installer
+# tests (sandboxed HOME, every tool they could reach stubbed, no network).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # The skin tests load real skins from the Winamp Skin Museum (checked
+      # by md5); without them those tests skip rather than fail.
+      - name: Test skins
+        run: ./tests/fetch-skins.sh || echo "::warning::couldn't fetch the test skins; skin tests will skip"
+
+      - name: Test
+        run: cargo test --locked
+
+  installer:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0   # gen-known-hashes.sh --check reads the history
+
+      - name: Known plugin hashes cover this commit
+        run: ./dist/gen-known-hashes.sh --check
+
+      - name: Installer tests (sandboxed HOME, stubbed omarchy/hyprctl/cliamp/cargo/curl/gh)
+        run: tests/install/run.sh

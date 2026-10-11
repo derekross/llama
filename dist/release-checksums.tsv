@@ -1,0 +1,3 @@
+# Release tarballs the installer may use, pinned here so the reviewed commit vouches
+# for the exact bytes: sha256, asset, the source commit its build attestation names, size in bytes.
+# Added with dist/pin-release.sh after each release; do not edit by hand.

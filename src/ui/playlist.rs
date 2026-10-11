@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use serde_json::json;
 
-use super::{Action, ChooserKind, PromptKind, Target, Ui, clock, font, op};
+use super::{Action, ChooserKind, Key, Mods, Pick, PromptKind, Target, Ui, clock, font, op};
 use crate::cliamp::engine::Live;
 use crate::skin::Sheet;
 use crate::skin::sprites::{self as sp, PlMenu, R};
@@ -15,6 +15,7 @@ pub enum Menu {
     Add,
     Rem,
     Sel,
+    Misc,
     List,
 }
 
@@ -24,6 +25,7 @@ impl Menu {
             Menu::Add => &sp::PL_ADD,
             Menu::Rem => &sp::PL_REM,
             Menu::Sel => &sp::PL_SEL,
+            Menu::Misc => &sp::PL_MISC,
             Menu::List => &sp::PL_LIST,
         }
     }
@@ -291,10 +293,15 @@ impl Ui {
         if sp::r(w - 20, h - 20, 20, 20).contains(x, y) {
             return Some(Target::PlResize);
         }
-        for kind in [Menu::Add, Menu::Rem, Menu::Sel, Menu::List] {
+        for kind in [Menu::Add, Menu::Rem, Menu::Sel, Menu::Misc, Menu::List] {
             if self.pl_menu_button(kind, w, h).contains(x, y) {
                 return Some(Target::PlMenu(kind));
             }
+        }
+        let (mx, my) = sp::PL_MINI_TRANSPORT_AT;
+        let (mx, my) = (w - 150 + mx, h - sp::PL_BOTTOM_H + my);
+        if (my..my + 10).contains(&y) && (mx..mx + 60).contains(&x) {
+            return Some(Target::PlTransport(((x - mx) / 10) as usize));
         }
         let b = body(sp::r(0, 0, w, h));
         if sp::r(w - 15, b.y, 8, b.h).contains(x, y) {
@@ -309,12 +316,28 @@ impl Ui {
         None
     }
 
-    /// Click selects; a second click on the same row within 400 ms plays it.
-    pub(super) fn pl_row_click(&mut self, i: usize) -> Vec<Action> {
+    /// Click selects; Ctrl-click toggles a row, Shift-click selects a range;
+    /// a second click on the same row within 400 ms plays it.
+    pub(super) fn pl_row_click(&mut self, i: usize, mods: Mods) -> Vec<Action> {
         let now = Instant::now();
         let double = matches!(self.view.pl_last_click, Some((j, t)) if j == i && now.duration_since(t).as_millis() < 400);
         self.view.pl_last_click = Some((i, now));
         self.view.press = None;
+        if mods.shift {
+            let a = self.view.pl_anchor.unwrap_or(i);
+            if !mods.ctrl {
+                self.view.pl_sel.clear();
+            }
+            self.view.pl_sel.extend(a.min(i)..=a.max(i));
+            return vec![];
+        }
+        self.view.pl_anchor = Some(i);
+        if mods.ctrl {
+            if !self.view.pl_sel.remove(&i) {
+                self.view.pl_sel.insert(i);
+            }
+            return vec![];
+        }
         self.view.pl_sel.clear();
         self.view.pl_sel.insert(i);
         if double {
@@ -351,11 +374,112 @@ impl Ui {
         self.remove_rows(sel.into_iter())
     }
 
+    /// Keys while the playlist has focus; `None` passes the key on.
+    pub(super) fn pl_key(
+        &mut self,
+        live: &Live,
+        key: Key,
+        ch: Option<char>,
+        mods: Mods,
+    ) -> Option<Vec<Action>> {
+        let n = live.queue.len();
+        if n == 0 {
+            return None;
+        }
+        if mods.ctrl && ch == Some('a') {
+            self.view.pl_sel = (0..n).collect();
+            return Some(vec![]);
+        }
+        let page = self
+            .layout()
+            .pl
+            .map_or(1, |r| self.pl_visible_rows(r).max(1) as usize);
+        let cur = self.view.pl_anchor.or(self.view.pl_sel.first().copied());
+        let to = match key {
+            Key::Up => cur.map_or(0, |c| c.saturating_sub(1)),
+            Key::Down => cur.map_or(0, |c| (c + 1).min(n - 1)),
+            Key::PageUp => cur.map_or(0, |c| c.saturating_sub(page)),
+            Key::PageDown => cur.map_or(0, |c| (c + page).min(n - 1)),
+            Key::Home => 0,
+            Key::End => n - 1,
+            _ => return None,
+        };
+        if mods.shift {
+            let a = self.view.pl_sel.first().copied().unwrap_or(to);
+            self.view.pl_sel = (a.min(to)..=a.max(to)).collect();
+        } else {
+            self.view.pl_sel.clear();
+            self.view.pl_sel.insert(to);
+        }
+        self.view.pl_anchor = Some(to);
+        self.pl_scroll_to(to, page);
+        Some(vec![])
+    }
+
+    /// Scrolls just enough to show row `i`.
+    fn pl_scroll_to(&mut self, i: usize, page: usize) {
+        if i < self.view.pl_scroll {
+            self.view.pl_scroll = i;
+        } else if i >= self.view.pl_scroll + page {
+            self.view.pl_scroll = i + 1 - page;
+        }
+    }
+
+    /// cliamp `queue.move`s that sort the live playlist by title, as a
+    /// selection sort: each move puts the next title in place.
+    fn sort_by_title(live: &Live) -> Vec<Action> {
+        let key = |t: &crate::cliamp::Track| t.display().to_lowercase();
+        let mut order: Vec<usize> = (0..live.queue.len()).collect();
+        let mut out = vec![];
+        for k in 0..order.len() {
+            let best = (k..order.len())
+                .min_by_key(|&j| key(&live.queue[order[j]]))
+                .unwrap_or(k);
+            if best != k {
+                out.push(op("queue.move", json!({"index": best, "to": k})));
+                let moved = order.remove(best);
+                order.insert(k, moved);
+            }
+        }
+        out
+    }
+
     pub(super) fn pl_menu_action(&mut self, live: &Live, kind: Menu, item: usize) -> Vec<Action> {
         let n = live.queue.len();
         match (kind, item) {
-            (Menu::Add, _) => {
+            (Menu::Add, 0) => {
                 self.open_prompt(PromptKind::AddLocation);
+                vec![]
+            }
+            (Menu::Add, 1) => vec![Action::PickFiles(Pick::AddFolder)],
+            (Menu::Add, _) => vec![Action::PickFiles(Pick::AddFiles)],
+            (Menu::Rem, 0) => {
+                self.note("Remove dead entries: cliamp skips them itself");
+                vec![]
+            }
+            (Menu::Misc, 0) => {
+                self.note("Sorting the playlist by title");
+                Self::sort_by_title(live)
+            }
+            (Menu::Misc, 1) => {
+                let t = self
+                    .view
+                    .pl_sel
+                    .first()
+                    .and_then(|&i| live.queue.get(i))
+                    .or(live.snap.now());
+                let text = t.map_or("No track selected".into(), |t| {
+                    if t.path.is_empty() {
+                        t.display()
+                    } else {
+                        format!("{}  *  {}", t.display(), t.path)
+                    }
+                });
+                self.note(text);
+                vec![]
+            }
+            (Menu::Misc, _) => {
+                self.note("Playlist options: use the bar panel's Library tab");
                 vec![]
             }
             (Menu::Rem, 1) => {
@@ -423,12 +547,11 @@ impl Ui {
 mod tests {
     use super::*;
     use crate::cliamp::Track;
-    use crate::skin::Skin;
     use crate::ui::View;
 
     fn setup() -> (Ui, Live) {
-        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/skins/base-2.91.wsz");
-        let ui = Ui::new(Skin::load(&p).unwrap(), View::default());
+        let skin = crate::skin::test_skin("base-2.91").unwrap_or_default();
+        let ui = Ui::new(skin, View::default());
         let live = Live {
             queue: (0..5)
                 .map(|i| Track {
@@ -459,11 +582,62 @@ mod tests {
     #[test]
     fn double_click_plays() {
         let (mut ui, _) = setup();
-        assert!(ui.pl_row_click(2).is_empty());
+        assert!(ui.pl_row_click(2, Mods::default()).is_empty());
         assert_eq!(
-            ui.pl_row_click(2),
+            ui.pl_row_click(2, Mods::default()),
             vec![op("queue.play", json!({"index": 2}))]
         );
+    }
+
+    #[test]
+    fn ctrl_and_shift_select() {
+        let (mut ui, _) = setup();
+        let ctrl = Mods {
+            ctrl: true,
+            ..Mods::default()
+        };
+        let shift = Mods {
+            shift: true,
+            ..Mods::default()
+        };
+        ui.pl_row_click(1, Mods::default());
+        ui.pl_row_click(3, ctrl);
+        assert_eq!(ui.view.pl_sel.iter().copied().collect::<Vec<_>>(), [1, 3]);
+        ui.pl_row_click(3, ctrl);
+        assert_eq!(ui.view.pl_sel.iter().copied().collect::<Vec<_>>(), [1]);
+        ui.pl_row_click(4, shift);
+        assert_eq!(ui.view.pl_sel.iter().copied().collect::<Vec<_>>(), [3, 4]);
+    }
+
+    #[test]
+    fn keyboard_moves_selection() {
+        let (mut ui, live) = setup();
+        let m = Mods::default();
+        ui.pl_key(&live, Key::Down, None, m);
+        ui.pl_key(&live, Key::Down, None, m);
+        assert_eq!(ui.view.pl_sel.first(), Some(&1));
+        ui.pl_key(&live, Key::End, None, m);
+        assert_eq!(ui.view.pl_sel.first(), Some(&4));
+        assert!(ui.pl_key(&live, Key::Left, None, m).is_none());
+    }
+
+    #[test]
+    fn sort_moves_into_title_order() {
+        let (_, mut live) = setup();
+        for (t, name) in live.queue.iter_mut().zip(["d", "b", "e", "a", "c"]) {
+            t.title = name.into();
+        }
+        let mut titles: Vec<String> = live.queue.iter().map(|t| t.title.clone()).collect();
+        for a in Ui::sort_by_title(&live) {
+            let Action::Op(_, v) = a else { panic!() };
+            let (i, to) = (
+                v["index"].as_u64().unwrap() as usize,
+                v["to"].as_u64().unwrap() as usize,
+            );
+            let t = titles.remove(i);
+            titles.insert(to, t);
+        }
+        assert_eq!(titles, ["a", "b", "c", "d", "e"]);
     }
 
     #[test]

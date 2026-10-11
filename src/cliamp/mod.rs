@@ -105,14 +105,16 @@ impl Client {
         Ok(serde_json::from_value(resp["result"]["bands"].clone()).unwrap_or_default())
     }
 
-    /// Submits an operation and returns its job id without waiting.
-    pub fn submit(&mut self, op: &str, params: Value) -> Result<String> {
+    /// Submits an operation without waiting; returns the job as submitted
+    /// (it may already have finished).
+    pub fn submit(&mut self, op: &str, params: Value) -> Result<Value> {
         let resp =
             self.call(json!({"method": "operation.submit", "operation": op, "params": params}))?;
-        resp["job"]["id"]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("no job id"))
+        let job = resp["job"].clone();
+        if job["id"].as_str().is_none() {
+            bail!("no job id");
+        }
+        Ok(job)
     }
 
     /// Submits an operation and polls its job until it finishes, returning
@@ -125,19 +127,26 @@ impl Client {
             .as_str()
             .map(str::to_string)
             .ok_or_else(|| anyhow!("no job id"))?;
-        for _ in 0..600 {
-            match job["state"].as_str() {
-                Some("succeeded") => return Ok(job["result"].clone()),
-                Some("failed") | Some("canceled") => {
-                    let err = job.get("error").cloned().unwrap_or(Value::Null);
-                    bail!("{op} failed: {err}");
-                }
-                _ => {}
+        // Poll quickly at first, then back off: a provider listing can run
+        // for minutes, and the deadline matches the engine's patience.
+        let deadline = std::time::Instant::now() + Duration::from_secs(600);
+        let mut wait = Duration::from_millis(50);
+        loop {
+            if let Some(r) = job_outcome(op, &job) {
+                return r;
             }
-            std::thread::sleep(Duration::from_millis(50));
-            job = self.call(json!({"method": "job.get", "job_id": id}))?["job"].clone();
+            if std::time::Instant::now() >= deadline {
+                bail!("{op} timed out");
+            }
+            std::thread::sleep(wait);
+            wait = (wait * 2).min(Duration::from_millis(500));
+            job = self.job(&id)?;
         }
-        bail!("{op} timed out")
+    }
+
+    /// A job's current record.
+    pub fn job(&mut self, id: &str) -> Result<Value> {
+        Ok(self.call(json!({"method": "job.get", "job_id": id}))?["job"].clone())
     }
 
     /// The live playlist, as cliamp's own track objects (they carry provider
@@ -147,13 +156,35 @@ impl Client {
         loop {
             let res = self.run("queue.list", json!({"offset": out.len(), "limit": 500}))?;
             let page: Vec<Value> = res["tracks"].as_array().cloned().unwrap_or_default();
-            let total = res["total"].as_u64().unwrap_or(0) as usize;
+            let total = res["total"].as_u64().map(|t| t as usize);
             let n = page.len();
             out.extend(page);
-            if n == 0 || out.len() >= total {
+            // Without a total, a short page is the last one.
+            let done = match total {
+                Some(t) => out.len() >= t,
+                None => n < 500,
+            };
+            if n == 0 || done {
                 return Ok(out);
             }
         }
+    }
+}
+
+/// `Some` once a job has finished: its result, or why it failed.
+pub fn job_outcome(op: &str, job: &Value) -> Option<Result<Value>> {
+    match job["state"].as_str() {
+        Some("succeeded") => Some(Ok(job["result"].clone())),
+        Some("failed") | Some("canceled") => {
+            let err = &job["error"];
+            let msg = err["message"]
+                .as_str()
+                .or(err.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| err.to_string());
+            Some(Err(anyhow!("{op}: {msg}")))
+        }
+        _ => None,
     }
 }
 

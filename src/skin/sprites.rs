@@ -371,6 +371,18 @@ pub const PL_SEL: PlMenu = PlMenu {
     ],
     x: 72,
 };
+pub const PL_MISC: PlMenu = PlMenu {
+    bar: r(200, 111, 3, 54),
+    items: &[
+        (r(154, 111, 22, 18), r(177, 111, 22, 18)), // SORT LIST
+        (r(154, 130, 22, 18), r(177, 130, 22, 18)), // FILE INFO
+        (r(154, 149, 22, 18), r(177, 149, 22, 18)), // MISC OPTIONS
+    ],
+    x: 101,
+};
+/// The six mini transport buttons in the bottom-right corner piece (prev,
+/// play, pause, stop, next, eject), 10×10 each, relative to its left edge.
+pub const PL_MINI_TRANSPORT_AT: (i32, i32) = (3, 22);
 pub const PL_LIST: PlMenu = PlMenu {
     bar: r(250, 111, 3, 54),
     items: &[
