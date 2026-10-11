@@ -1,3 +1,5 @@
 # Release tarballs the installer may use, pinned here so the reviewed commit vouches
 # for the exact bytes: sha256, asset, the source commit its build attestation names, size in bytes.
 # Added with dist/pin-release.sh after each release; do not edit by hand.
+1cb7349795eaeadac7c3c332bcf051ab74e4c7b378d3fe3f5998b1816f00cd56	llama-v0.2.0-x86_64-linux.tar.gz	b7c1061513fcf752858a53ca53a743f317ac3304	1942877
+b5b9d249e4c132557c8c22c9d111a567aa2b4a50237948ce2eed5f147356369a	llama-v0.2.0-aarch64-linux.tar.gz	b7c1061513fcf752858a53ca53a743f317ac3304	1832146
