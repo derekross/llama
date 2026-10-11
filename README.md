@@ -63,8 +63,8 @@ Drop a `.wsz` file anywhere on the window to wear it.
   - **Now Playing:** transport, seek, volume, shuffle and repeat.
   - **Library:** pick any configured cliamp source, then search it or browse its playlists. Click plays, right-click queues.
   - **Skins:** browse the Museum's favorites or search all ~100k skins. Click one and the running player switches to it immediately.
-- Middle-click opens the player.
-- Right-click plays or pauses.
+- Right-click opens the player.
+- Middle-click plays or pauses.
 - The scroll wheel changes the volume.
 
 **The CLI:**

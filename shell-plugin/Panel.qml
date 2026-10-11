@@ -213,7 +213,7 @@ Panel {
       onStreamFinished: {
         var r = Model.parse(text)
         if (r) root.currentSkin = r
-        root.skinStatus = r && !r.running ? "Worn — middle-click the bar icon to open Llama" : ""
+        root.skinStatus = r && !r.running ? "Worn — right-click the bar icon to open Llama" : ""
       }
     }
     onExited: function(code) { if (code !== 0) root.skinStatus = "That skin would not load" }

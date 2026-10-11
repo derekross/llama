@@ -108,5 +108,5 @@ cat <<EOF
 
 Done. Next:
   omarchy plugin enable derekross.llama     the bar widget
-  llama                                     the player (or middle-click the bar icon)
+  llama                                     the player (or right-click the bar icon)
 EOF

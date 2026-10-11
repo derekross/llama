@@ -5,8 +5,8 @@ import qs.Commons
 import qs.Ui
 
 // The bar pill: a note while cliamp plays, dimmed when it does not. Left
-// click opens the panel, middle click opens (or focuses) the Llama window,
-// right click plays/pauses, the wheel changes the volume.
+// click opens the panel, right click opens (or focuses) the Llama window,
+// middle click plays/pauses, the wheel changes the volume.
 BarWidget {
   id: root
   moduleName: "derekross.llama"
@@ -69,13 +69,13 @@ BarWidget {
     fontSize: root.showTitle ? Style.font.caption : Style.bar.iconFont
     dimmed: !root.playing
     tooltipText: root.panel && root.panel.nowTitle !== ""
-      ? root.panel.nowTitle + "\nClick: Llama · Middle: player window · Right: play/pause"
-      : "Llama — click to browse, middle-click for the player window"
+      ? root.panel.nowTitle + "\nClick: Llama · Right: player window · Middle: play/pause"
+      : "Llama — click to browse, right-click for the player window"
 
     onPressed: function(b) {
       if (!root.panel) return
-      if (b === Qt.MiddleButton) root.panel.launchPlayer()
-      else if (b === Qt.RightButton) root.panel.cliamp(["toggle"])
+      if (b === Qt.RightButton) root.panel.launchPlayer()
+      else if (b === Qt.MiddleButton) root.panel.cliamp(["toggle"])
       else root.togglePanel()
     }
     onWheelMoved: function(delta) {
