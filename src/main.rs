@@ -22,6 +22,7 @@ llama — Winamp 2.x for Omarchy, with cliamp as the engine
   llama --skin <md5|link|file>  wear a skin, then open
   llama --zoom N              physical pixels per skin pixel (default 2)
   llama --no-engine           do not start a cliamp daemon
+  llama --hide                minimize the player (llama brings it back)
   llama --quit                close a running player
 
   llama skin use <md5|museum link|file.wsz>   wear a skin (live)
@@ -102,6 +103,12 @@ fn player(args: &[String]) -> Result<()> {
                 )
             }
             "--no-engine" => engine = false,
+            "--hide" => {
+                if send_control("hide").is_none() {
+                    println!("Llama is not running");
+                }
+                return Ok(());
+            }
             "--quit" => {
                 match send_control("quit") {
                     Some(_) => println!("Llama closed"),
@@ -123,7 +130,10 @@ fn player(args: &[String]) -> Result<()> {
     }
 
     // One window at a time: a second launch focuses the first.
-    if send_control("ping").is_some() {
+    if send_control("show").is_some() {
+        // A minimized window maps again asynchronously; give it a moment
+        // before asking Hyprland to focus it.
+        std::thread::sleep(Duration::from_millis(150));
         focus_existing();
         return Ok(());
     }
@@ -133,6 +143,8 @@ fn player(args: &[String]) -> Result<()> {
     let base = load_base();
 
     let (ping, quit_src) = make_ping()?;
+    let (show, show_src) = make_ping()?;
+    let (hide, hide_src) = make_ping()?;
     let _ = QUIT.set(ping.clone());
     unsafe {
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
@@ -148,8 +160,11 @@ fn player(args: &[String]) -> Result<()> {
             }
             let mut w = &stream;
             let _ = writeln!(w, "ok");
-            if line.trim() == "quit" {
-                ping.ping();
+            match line.trim() {
+                "quit" => ping.ping(),
+                "show" => show.ping(),
+                "hide" => hide.ping(),
+                _ => {}
             }
         }
     });
@@ -165,6 +180,8 @@ fn player(args: &[String]) -> Result<()> {
     let result = llama::wl::run(llama::wl::Opts {
         base,
         quit: quit_src,
+        show: show_src,
+        hide: hide_src,
     });
 
     if let Some(mut child) = started {

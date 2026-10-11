@@ -67,6 +67,10 @@ pub struct Opts {
     pub base: Skin,
     /// Pinged to close the window (`llama --quit`, SIGTERM).
     pub quit: ping::PingSource,
+    /// Pinged to bring a minimized window back (a second `llama`).
+    pub show: ping::PingSource,
+    /// Pinged to minimize (`llama --hide`).
+    pub hide: ping::PingSource,
 }
 
 pub fn run(opts: Opts) -> Result<()> {
@@ -85,13 +89,15 @@ pub fn run(opts: Opts) -> Result<()> {
     let shm = Shm::bind(&globals, &qh).context("wl_shm")?;
     let dnd = DataDeviceManagerState::bind(&globals, &qh).ok();
 
-    let surface = compositor.create_surface(&qh);
-    let viewport = bind_viewporter(&globals, &qh).map(|vp| vp.get_viewport(&surface, &qh, ()));
-    let fractional =
-        bind_fractional(&globals, &qh).map(|m| m.get_fractional_scale(&surface, &qh, ()));
-    let window = xdg.create_window(surface, WindowDecorations::None, &qh);
-    window.set_title("Llama");
-    window.set_app_id(APP_ID);
+    let viewporter = bind_viewporter(&globals, &qh);
+    let fractional_mgr = bind_fractional(&globals, &qh);
+    let (window, viewport, fractional) = new_window(
+        &compositor,
+        &xdg,
+        viewporter.as_ref(),
+        fractional_mgr.as_ref(),
+        &qh,
+    );
 
     let state = State::load();
     let view = View {
@@ -115,6 +121,12 @@ pub fn run(opts: Opts) -> Result<()> {
     handle
         .insert_source(opts.quit, |_, _, app: &mut App| app.exit = true)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    handle
+        .insert_source(opts.show, |_, _, app: &mut App| app.show())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    handle
+        .insert_source(opts.hide, |_, _, app: &mut App| app.hide())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Animation and housekeeping: ~30 fps while something moves, otherwise
     // a slow tick that also notices skin changes made from the bar.
@@ -135,6 +147,9 @@ pub fn run(opts: Opts) -> Result<()> {
         seats: SeatState::new(&globals, &qh),
         outputs: OutputState::new(&globals, &qh),
         compositor,
+        xdg,
+        viewporter,
+        fractional_mgr,
         shm,
         dnd,
         data_device: None,
@@ -144,6 +159,7 @@ pub fn run(opts: Opts) -> Result<()> {
         _fractional: fractional,
         scale: 1.0,
         configured: false,
+        hidden: false,
         frame_pending: false,
         dirty: true,
         exit: false,
@@ -171,6 +187,28 @@ pub fn run(opts: Opts) -> Result<()> {
     }
     app.save_state();
     Ok(())
+}
+
+/// A fresh toplevel with its scaling objects. It stays unmapped until its
+/// first commit.
+fn new_window(
+    compositor: &CompositorState,
+    xdg: &XdgShell,
+    viewporter: Option<&wp_viewporter::WpViewporter>,
+    fractional_mgr: Option<&wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
+    qh: &QueueHandle<App>,
+) -> (
+    Window,
+    Option<wp_viewport::WpViewport>,
+    Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
+) {
+    let surface = compositor.create_surface(qh);
+    let viewport = viewporter.map(|vp| vp.get_viewport(&surface, qh, ()));
+    let fractional = fractional_mgr.map(|m| m.get_fractional_scale(&surface, qh, ()));
+    let window = xdg.create_window(surface, WindowDecorations::None, qh);
+    window.set_title("Llama");
+    window.set_app_id(APP_ID);
+    (window, viewport, fractional)
 }
 
 fn bind_viewporter(
@@ -214,11 +252,16 @@ struct App {
     dnd: Option<DataDeviceManagerState>,
     data_device: Option<DataDevice>,
     pool: SlotPool,
+    xdg: XdgShell,
+    viewporter: Option<wp_viewporter::WpViewporter>,
+    fractional_mgr: Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
     window: Window,
     viewport: Option<wp_viewport::WpViewport>,
     _fractional: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
     scale: f64,
     configured: bool,
+    /// Minimized: unmapped, while the music plays on.
+    hidden: bool,
     frame_pending: bool,
     dirty: bool,
     exit: bool,
@@ -254,6 +297,46 @@ impl App {
             (x * self.scale / z).floor() as i32,
             (y * self.scale / z).floor() as i32,
         )
+    }
+
+    /// Minimizes. Hyprland has no minimized state for a window to go to, so
+    /// the window goes away instead, swapped for a fresh toplevel that stays
+    /// unmapped until `show` commits it (Hyprland will not remap a toplevel
+    /// once it has been unmapped). The bar icon or a second `llama` brings it
+    /// back.
+    fn hide(&mut self) {
+        if self.hidden {
+            return;
+        }
+        let (window, viewport, fractional) = new_window(
+            &self.compositor,
+            &self.xdg,
+            self.viewporter.as_ref(),
+            self.fractional_mgr.as_ref(),
+            &self.qh,
+        );
+        if let Some(v) = std::mem::replace(&mut self.viewport, viewport) {
+            v.destroy();
+        }
+        if let Some(f) = std::mem::replace(&mut self._fractional, fractional) {
+            f.destroy();
+        }
+        drop(std::mem::replace(&mut self.window, window));
+        self.hidden = true;
+        self.configured = false;
+        self.frame_pending = false;
+        self.ui.view.press = None;
+    }
+
+    /// Maps the window again: the fresh toplevel's first commit starts the
+    /// configure handshake, and the first configure draws.
+    fn show(&mut self) {
+        if !self.hidden {
+            return;
+        }
+        self.hidden = false;
+        self.dirty = true;
+        self.window.commit();
     }
 
     fn redraw(&mut self) {
@@ -365,9 +448,10 @@ impl App {
         let animating = self.ui.animating(&live) || self.ui.view.press.is_some();
         let want_vis = self.ui.view.vis_on;
         drop(live);
-        self.engine
-            .want_spectrum
-            .store(want_vis, std::sync::atomic::Ordering::Relaxed);
+        self.engine.want_spectrum.store(
+            want_vis && !self.hidden,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if animating || self.dirty {
             self.redraw();
         }
@@ -385,7 +469,7 @@ impl App {
                     }
                 }
                 Action::Close => self.exit = true,
-                Action::Minimize => self.window.set_minimized(),
+                Action::Minimize => self.hide(),
                 Action::Resize | Action::Zoom => layout_changed = true,
             }
         }
@@ -439,7 +523,7 @@ impl CompositorHandler for App {
 
     fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
         self.frame_pending = false;
-        if self.dirty {
+        if self.dirty && self.configured {
             self.draw();
         }
     }

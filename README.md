@@ -47,6 +47,7 @@ omarchy plugin enable derekross.llama
 **The window** works like Winamp:
 
 - Drag the title bar to move it. Double-click the title bar to shade it.
+- Minimize hides the window while the music keeps playing. Right-click the bar icon (or run `llama`) to bring it back.
 - The EQ and PL buttons fold the equalizer and playlist in and out.
 - The clutterbar **D** button switches to double size.
 - Click the time to toggle remaining time. Click the visualizer to turn it off.
@@ -73,6 +74,7 @@ Drop a `.wsz` file anywhere on the window to wear it.
 llama                          # open the player, or focus the one already open
 llama --skin <md5|museum link|file.wsz>
 llama --zoom 3                 # physical pixels per skin pixel (default 2)
+llama --hide                   # minimize; `llama` or right-clicking the bar icon brings it back
 llama --quit
 llama skin use|base|current|featured|search|list
 ```
