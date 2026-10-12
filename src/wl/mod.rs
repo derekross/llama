@@ -85,6 +85,8 @@ pub struct Opts {
     pub show: ping::PingSource,
     /// Pinged to minimize (`llama --hide`).
     pub hide: ping::PingSource,
+    /// Status text for the marquee (`llama --status`), `None` to clear.
+    pub status: Channel<Option<String>>,
 }
 
 pub fn run(opts: Opts) -> Result<()> {
@@ -143,6 +145,14 @@ pub fn run(opts: Opts) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     handle
         .insert_source(opts.hide, |_, _, app: &mut App| app.hide())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    handle
+        .insert_source(opts.status, |event, _, app: &mut App| {
+            if let channel::Event::Msg(text) = event {
+                app.ui.view.status = text.map(|t| (t, std::time::Instant::now()));
+                app.dirty = true;
+            }
+        })
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let (msgs, msg_src): (channel::Sender<Msg>, Channel<Msg>) = channel::channel();
@@ -572,6 +582,13 @@ impl App {
             && at.elapsed() > crate::ui::NOTE_FOR
         {
             self.ui.view.note = None;
+            self.dirty = true;
+        }
+        // A status whose sender died without clearing it.
+        if let Some((_, at)) = &self.ui.view.status
+            && at.elapsed() > crate::ui::STATUS_FOR
+        {
+            self.ui.view.status = None;
             self.dirty = true;
         }
         let live = self.engine.live.clone();

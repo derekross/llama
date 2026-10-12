@@ -171,6 +171,9 @@ pub struct View {
     pub pl_anchor: Option<usize>,
     /// A short message that takes over the marquee for a moment.
     pub note: Option<(String, Instant)>,
+    /// What the bar widget is doing for the player (loading a playlist),
+    /// shown in the marquee until it says it is done.
+    pub status: Option<(String, Instant)>,
 }
 
 impl Default for View {
@@ -201,6 +204,7 @@ impl Default for View {
             pl_focus: false,
             pl_anchor: None,
             note: None,
+            status: None,
         }
     }
 }
@@ -364,7 +368,11 @@ impl Ui {
     pub fn animating(&self, live: &Live) -> bool {
         let scrolling = self.marquee_text.chars().count() as i32 * sp::CHAR_W > sp::MARQUEE.w;
         let vis = self.view.vis_on && (live.snap.playing() || self.peaks.iter().any(|&p| p > 0.0));
-        vis || scrolling || live.busy() || live.snap.paused() || self.view.note.is_some()
+        vis || scrolling
+            || live.busy()
+            || live.snap.paused()
+            || self.view.note.is_some()
+            || self.view.status.is_some()
     }
 
     /// Forgets the visualizer's bars, so a hidden or switched-off visualizer
@@ -946,6 +954,8 @@ fn track_info(live: &Live) -> String {
 
 /// How long a note holds the marquee.
 pub const NOTE_FOR: Duration = Duration::from_secs(4);
+/// The longest a status stays up uncleared: the bar's own load timeout.
+pub const STATUS_FOR: Duration = Duration::from_secs(600);
 
 fn expand_home(p: &str) -> String {
     if let Some(rest) = p.strip_prefix("~/")

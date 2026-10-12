@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use llama::museum;
 use llama::skin::Skin;
 use llama::store::{self, State};
+use smithay_client_toolkit::reexports::calloop::channel;
 use smithay_client_toolkit::reexports::calloop::ping::{Ping, make_ping};
 
 const HELP: &str = "\
@@ -24,6 +25,8 @@ llama — Winamp 2.x for Omarchy, with cliamp as the engine
   llama --zoom N              physical pixels per skin pixel (default 2)
   llama --no-engine           do not start a cliamp daemon
   llama --hide                minimize the player (llama brings it back)
+  llama --status <text>       show text in the player's title display until
+                              cleared with an empty text (bar widget loads)
   llama --quit                close a running player
 
   llama skin use <md5|museum link|file.wsz>   wear a skin (live)
@@ -103,6 +106,17 @@ fn player(args: &[String]) -> Result<()> {
                 }
                 return Ok(());
             }
+            "--status" => {
+                let text = it.next().context("--status needs text (\"\" clears)")?;
+                // One line on the control socket; a stopped player has
+                // nothing to show it in, which is fine.
+                let text: String = text
+                    .chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect();
+                let _ = send_control(format!("status {text}").trim_end());
+                return Ok(());
+            }
             "--quit" => {
                 match send_control("quit") {
                     Some(_) => println!("Llama closed"),
@@ -148,6 +162,7 @@ fn player(args: &[String]) -> Result<()> {
     let (ping, quit_src) = make_ping()?;
     let (show, show_src) = make_ping()?;
     let (hide, hide_src) = make_ping()?;
+    let (status, status_src) = channel::channel::<Option<String>>();
     let _ = QUIT.set(ping.clone());
     unsafe {
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
@@ -171,7 +186,14 @@ fn player(args: &[String]) -> Result<()> {
                 "quit" => ping.ping(),
                 "show" => show.ping(),
                 "hide" => hide.ping(),
-                _ => {}
+                "status" => {
+                    let _ = status.send(None);
+                }
+                l => {
+                    if let Some(text) = l.strip_prefix("status ") {
+                        let _ = status.send(Some(text.to_string()));
+                    }
+                }
             }
         }
     });
@@ -212,6 +234,7 @@ fn player(args: &[String]) -> Result<()> {
         quit: quit_src,
         show: show_src,
         hide: hide_src,
+        status: status_src,
     });
 
     let started = started.lock().unwrap().take();

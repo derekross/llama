@@ -268,6 +268,11 @@ Panel {
       "Loading " + item.name + "… A big playlist can take minutes, and playback controls wait until it is done.",
       600000)
   }
+  // Shows text in the player's title display while the bar works for it
+  // ("" clears). A player that is not open simply ignores it.
+  function tellPlayer(text) {
+    if (llamaInstalled) run([llamaBin, "--status", text], 5000, function(r) {})
+  }
   // Load, and play once the load is done (not alongside it).
   function playPlaylist(item) {
     if (playReq) { playReq.cancel(); playReq = null }
@@ -275,9 +280,11 @@ Panel {
     var gen = playGen
     var msg = "Loading " + item.name + " to play it… A big playlist can take minutes."
     libraryStatus = msg
+    tellPlayer("Loading " + item.name + "... A big playlist can take minutes.")
     playReq = run(cliampCall("provider.load", { provider: provider, playlist: item.id }), 600000, function(r) {
       if (gen !== root.playGen) return
       root.playReq = null
+      root.tellPlayer("")
       if (r.code === 0 && !r.timedOut && Model.callOk(r.out)) {
         root.remote("play", {})
         if (root.libraryStatus === msg) root.libraryStatus = ""

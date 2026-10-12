@@ -338,6 +338,12 @@ impl Ui {
             _ if self.view.note.is_some() => {
                 self.view.note.as_ref().map(|n| n.0.clone()).unwrap_or_default()
             }
+            _ if self.view.status.is_some() => self
+                .view
+                .status
+                .as_ref()
+                .map(|s| format!("{}  ***  ", s.0))
+                .unwrap_or_default(),
             _ if !live.connected => "Llama: waiting for cliamp...".into(),
             _ if live.busy() => {
                 "cliamp is busy loading from a provider; your clicks will go through when it is done  ***  ".into()
@@ -586,6 +592,17 @@ mod tests {
         assert_eq!(u.main_target(100, 76), Some(Target::Seek));
         assert_eq!(u.main_target(170, 95), Some(Target::Shuffle));
         assert_eq!(u.main_target(11, 48), Some(Target::Clutter(3)));
+    }
+
+    #[test]
+    fn status_holds_the_marquee_until_cleared() {
+        let mut u = ui();
+        let live = Live::default();
+        u.view.status = Some(("Loading Mix...".into(), std::time::Instant::now()));
+        assert!(u.marquee(&live).starts_with("Loading Mix..."));
+        assert!(u.animating(&live));
+        u.view.status = None;
+        assert!(!u.marquee(&live).starts_with("Loading"));
     }
 
     #[test]
