@@ -6,10 +6,10 @@
 
 pub mod engine;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -44,6 +44,42 @@ pub struct Client {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
     next_id: u64,
+    patience: Duration,
+    /// Set once a reply is known lost: the connection's request/response
+    /// pairing can no longer be trusted, so every later call fails and the
+    /// owner reconnects.
+    broken: bool,
+}
+
+/// How often a read waiting on cliamp wakes to check on it.
+const READ_POLL: Duration = Duration::from_secs(1);
+/// How late a reply must be before cliamp is probed on a second connection.
+const LOST_AFTER: Duration = Duration::from_secs(3);
+/// The least time between two probes, so a cliamp that really is busy is not
+/// piled up with them.
+const PROBE_EVERY: Duration = Duration::from_secs(5);
+/// How long a probe waits for its answer.
+const PROBE_PATIENCE: Duration = Duration::from_secs(1);
+
+/// True when cliamp answers a `state.get` on a fresh connection right away.
+///
+/// cliamp gives up writing a reply it cannot deliver in time (its log says
+/// `ipc: write response: … i/o timeout`), which happens to a long-lived
+/// connection while a big provider load runs. The request on that connection
+/// then never gets an answer. A cliamp that is still busy does not answer the
+/// probe either; one that answers it promptly has dropped the reply.
+fn answers_now() -> bool {
+    let probe = || -> Result<bool> {
+        let stream = UnixStream::connect(socket_path())?;
+        stream.set_read_timeout(Some(PROBE_PATIENCE))?;
+        stream.set_write_timeout(Some(PROBE_PATIENCE))?;
+        (&stream).write_all(b"{\"version\":2,\"id\":\"llama-probe\",\"method\":\"state.get\"}\n")?;
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line)?;
+        let resp: Value = serde_json::from_str(&line)?;
+        Ok(resp.get("ok").and_then(Value::as_bool) == Some(true))
+    };
+    probe().unwrap_or(false)
 }
 
 impl Client {
@@ -59,16 +95,22 @@ impl Client {
         let path = socket_path();
         let stream = UnixStream::connect(&path)
             .with_context(|| format!("connecting to {}", path.display()))?;
-        stream.set_read_timeout(Some(patience))?;
+        // Reads wake every READ_POLL; `call` waits out `patience` itself.
+        stream.set_read_timeout(Some(READ_POLL.min(patience)))?;
         let writer = stream.try_clone()?;
         Ok(Client {
             reader: BufReader::new(stream),
             writer,
             next_id: 0,
+            patience,
+            broken: false,
         })
     }
 
     fn call(&mut self, mut req: Value) -> Result<Value> {
+        if self.broken {
+            bail!("cliamp dropped a reply; reconnecting");
+        }
         self.next_id += 1;
         let id = format!("llama-{}", self.next_id);
         req["version"] = json!(2);
@@ -76,12 +118,32 @@ impl Client {
         let mut line = serde_json::to_vec(&req)?;
         line.push(b'\n');
         self.writer.write_all(&line)?;
+        let sent = Instant::now();
+        let mut probed: Option<Instant> = None;
+        // Kept across read timeouts: a timed-out read keeps what it got.
+        let mut buf = Vec::new();
         loop {
-            let mut buf = String::new();
-            if self.reader.read_line(&mut buf)? == 0 {
-                bail!("cliamp closed the connection");
+            match self.reader.read_until(b'\n', &mut buf) {
+                Ok(0) => bail!("cliamp closed the connection"),
+                Ok(_) => {}
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    let late = sent.elapsed();
+                    if late >= self.patience {
+                        bail!("cliamp did not answer in {}s", self.patience.as_secs());
+                    }
+                    if late >= LOST_AFTER && probed.is_none_or(|t| t.elapsed() >= PROBE_EVERY) {
+                        probed = Some(Instant::now());
+                        if answers_now() {
+                            self.broken = true;
+                            bail!("cliamp dropped a reply; reconnecting");
+                        }
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
             }
-            let resp: Value = serde_json::from_str(&buf).context("bad JSON from cliamp")?;
+            let resp: Value = serde_json::from_slice(&buf).context("bad JSON from cliamp")?;
+            buf.clear();
             // Responses come back in order on a request connection, but be
             // strict anyway: skip anything that is not ours.
             if resp.get("id").and_then(Value::as_str) != Some(id.as_str()) {
