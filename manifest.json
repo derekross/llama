@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "derekross.llama",
   "name": "Llama",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": "Derek Ross",
   "license": "MIT",
   "description": "Winamp 2.x for Omarchy. A mini player in the bar, every cliamp source (Spotify, Tidal, YouTube Music, Plex, Jellyfin, radio...) a search away, and 100,000 classic skins from the Winamp Skin Museum for the Llama player window. Needs the llama binary: run dist/install.sh.",

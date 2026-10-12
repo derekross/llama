@@ -73,7 +73,8 @@ fn answers_now() -> bool {
         let stream = UnixStream::connect(socket_path())?;
         stream.set_read_timeout(Some(PROBE_PATIENCE))?;
         stream.set_write_timeout(Some(PROBE_PATIENCE))?;
-        (&stream).write_all(b"{\"version\":2,\"id\":\"llama-probe\",\"method\":\"state.get\"}\n")?;
+        (&stream)
+            .write_all(b"{\"version\":2,\"id\":\"llama-probe\",\"method\":\"state.get\"}\n")?;
         let mut line = String::new();
         BufReader::new(&stream).read_line(&mut line)?;
         let resp: Value = serde_json::from_str(&line)?;
